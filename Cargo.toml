@@ -1,11 +1,11 @@
 [package]
 name = "dtg-credentials"
 description = "Decentralized Trust Graph (DTG) Credentials Library"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 publish = true
 authors = ["Glenn Gore <glenn@affinidi.com>"]
-rust-version = "1.90.0"
+rust-version = "1.94.0"
 readme = "README.md"
 license = "Apache-2.0"
 repository = "https://github.com/OpenVTC/dtg-credentials"
@@ -15,7 +15,7 @@ default = ["affinidi-signing"]
 affinidi-signing = ["dep:affinidi-secrets-resolver"]
 
 [dependencies]
-affinidi-data-integrity = "0.5"
+affinidi-data-integrity = "0.6"
 affinidi-secrets-resolver = { version = "0.5", optional = true }
 
 chrono = "0.4"
