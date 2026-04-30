@@ -3,7 +3,7 @@
 
 use affinidi_data_integrity::DataIntegrityProof;
 #[cfg(feature = "affinidi-signing")]
-use affinidi_data_integrity::{DataIntegrityError, verification_proof::VerificationProof};
+use affinidi_data_integrity::{DataIntegrityError, SignOptions, VerifyOptions};
 #[cfg(feature = "affinidi-signing")]
 use affinidi_secrets_resolver::secrets::Secret;
 use chrono::{DateTime, Utc};
@@ -132,13 +132,12 @@ impl DTGCredential {
         signing_secret: &Secret,
         create_time: Option<DateTime<Utc>>,
     ) -> Result<DataIntegrityProof, DTGCredentialError> {
-        let proof = DataIntegrityProof::sign_jcs_data(
-            self,
-            None,
-            signing_secret,
-            create_time.map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-        )
-        .await?;
+        let mut options = SignOptions::new();
+        if let Some(ts) = create_time {
+            options = options.with_created(ts);
+        }
+
+        let proof = DataIntegrityProof::sign(self, signing_secret, options).await?;
 
         self.credential.proof = Some(proof.clone());
         Ok(proof)
@@ -151,7 +150,7 @@ impl DTGCredential {
     pub fn verify_proof_with_public_key(
         &self,
         public_key_bytes: &[u8],
-    ) -> Result<VerificationProof, DTGCredentialError> {
+    ) -> Result<(), DTGCredentialError> {
         let proof = if let Some(proof) = &self.credential.proof {
             proof.clone()
         } else {
@@ -166,14 +165,8 @@ impl DTGCredential {
             ..self.credential.clone()
         };
 
-        Ok(
-            affinidi_data_integrity::verification_proof::verify_data_with_public_key(
-                &unsigned,
-                None,
-                &proof,
-                public_key_bytes,
-            )?,
-        )
+        proof.verify_with_public_key(&unsigned, public_key_bytes, VerifyOptions::new())?;
+        Ok(())
     }
 
     /// Is this credential a W3C VC Version 1.1 or 2.0 credential?
