@@ -8,7 +8,7 @@
 
 use affinidi_tdk::{
     TDK,
-    common::config::TDKConfigBuilder,
+    common::config::TDKConfig,
     dids::{DID, KeyType},
 };
 use anyhow::Result;
@@ -20,9 +20,7 @@ async fn main() -> Result<()> {
     // Instantiate the TDK
     // No environment needs to be loaded as this example is ephemeral
     let tdk = TDK::new(
-        TDKConfigBuilder::new()
-            .with_load_environment(false)
-            .build()?,
+        TDKConfig::builder().with_load_environment(false).build()?,
         None,
     )
     .await?;
