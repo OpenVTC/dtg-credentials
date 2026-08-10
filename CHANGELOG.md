@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-10
+
 ### Added
 
 - `taskContext` property on `DTGCommon`, per the Trust Task Context Binding section of the
@@ -29,12 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING:** `DTGCredential::new_vwc()` takes a required `task_context: String` argument
 - **BREAKING:** Deserializing a `WitnessCredential` without a `taskContext` now fails with
   `DTGCredentialError::MissingTaskContext`
-- `DTGCredential::sign()` is now an `async` method (breaking change) to align with upstream `affinidi-data-integrity` v0.5
-- Updated `affinidi-data-integrity` dependency from 0.4 to 0.5
-- Updated `affinidi-tdk` dev-dependency from 0.5 to 0.6
-- Relaxed `tokio` dev-dependency version from 1.49 to 1
-- Updated repository URL to `https://github.com/OpenVTC/dtg-credentials`
-- Enabled crate publishing (`publish = true`)
+- Added `multibase`, `sha2` and `serde_json_canonicalizer` as direct dependencies (all were
+  already present transitively via `affinidi-data-integrity`)
 
 ### Deprecated
 
@@ -45,20 +43,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- **Divergence from Working Draft 01:** the specification requires the VWC `digest` to be
-  encoded as `sha256:` followed by a lowercase hex digest. This library instead uses a
+- **⚠️ KNOWN SPEC DIVERGENCE — VWC `digest` encoding.** WD-01 requires the VWC `digest` to be
+  encoded as `sha256:` followed by a lowercase hex digest. This library instead emits a
   multibase-encoded multihash (base58btc, `z...`), matching the W3C `digestMultibase`
   convention used elsewhere in the VC ecosystem. The underlying hash — SHA-256 over the JCS
-  (RFC 8785) canonical form — is identical; only the encoding differs. This should be raised
-  with the DTGWG for alignment
+  (RFC 8785) canonical form — is identical; only the encoding differs.
+  **VWCs produced by this library do not interoperate with spec-conformant implementations
+  in either direction:** `verify_digest()` rejects conformant VWCs, and conformant verifiers
+  reject ours. Unresolved; to be raised with the DTGWG. See README.md
 
-## [0.1.1] - 2025-01-01
+## [0.1.3] - 2026-06-06
 
 ### Changed
 
-- Updated Affinidi dependencies to latest versions
+- Updated `affinidi-data-integrity` dependency from 0.6 to 0.7
+- Updated `affinidi-tdk` dev-dependency from 0.6 to 0.7
 
-## [0.1.0] - 2025-01-01
+## [0.1.2] - 2026-04-30
+
+### Changed
+
+- Updated `affinidi-data-integrity` dependency from 0.5 to 0.6
+
+### Fixed
+
+- Migrated to the `affinidi-data-integrity` 0.6 API
+
+## [0.1.1] - 2026-03-29
+
+### Changed
+
+- `DTGCredential::sign()` is now an `async` method (breaking change) to align with upstream `affinidi-data-integrity` v0.5
+- Updated `affinidi-data-integrity` dependency from 0.4 to 0.5
+- Updated `affinidi-tdk` dev-dependency from 0.5 to 0.6
+- Relaxed `tokio` dev-dependency version from 1.49 to 1
+- Updated repository URL to `https://github.com/OpenVTC/dtg-credentials`
+- Enabled crate publishing (`publish = true`)
+
+## [0.1.0] - 2026-02-25
+
+Never published to crates.io; `publish` was enabled in 0.1.1.
 
 ### Added
 
