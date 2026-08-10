@@ -19,10 +19,10 @@ pub mod create;
 /// What W3C VC Format is the credential using?
 #[derive(Clone, Copy, Debug)]
 pub enum W3CVCVersion {
-    /// https://www.w3.org/2018/credentials/v1
+    /// <https://www.w3.org/2018/credentials/v1>
     V1_1,
 
-    /// https://www.w3.org/ns/credentials/v2
+    /// <https://www.w3.org/ns/credentials/v2>
     V2_0,
 }
 
@@ -140,9 +140,17 @@ impl DTGCredential {
     /// wrapped as a multihash and encoded as a base58btc multibase string (`z...`), matching
     /// the W3C `digestMultibase` convention.
     ///
-    /// NOTE: This intentionally differs from the DTG Core Credentials Working Draft 01, which
-    /// specifies a `sha256:<lowercase-hex>` encoding. The underlying hash is the same; only the
-    /// encoding differs. See CHANGELOG.md.
+    /// # ⚠️ Known spec divergence
+    ///
+    /// This encoding is **not** what DTG Core Credentials Working Draft 01 specifies. WD-01
+    /// requires `sha256:` followed by a lowercase hex digest; this returns a multibase
+    /// multihash. The underlying hash is identical — only the encoding differs — but the
+    /// literal `digest` strings will not match, so **VWCs built with this value will not
+    /// interoperate with spec-conformant implementations**, and [DTGCredential::verify_digest]
+    /// will reject conformant VWCs from elsewhere.
+    ///
+    /// This is unresolved and should be raised with the DTGWG. Do not rely on this function
+    /// if you must interoperate with conformant implementations today. See README.md.
     ///
     /// The digest covers the credential exactly as it stands, including its `proof` if it has
     /// been signed. A witness should therefore digest the VRC in the form it was witnessed in.
@@ -162,6 +170,13 @@ impl DTGCredential {
     ///
     /// Returns `Ok(false)` if the digests do not match, or if this credential carries no
     /// `digest` (it is OPTIONAL), in which case there is nothing to rely on.
+    ///
+    /// # ⚠️ Known spec divergence
+    ///
+    /// This compares against [DTGCredential::digest_multibase], whose encoding differs from
+    /// DTG Core Credentials Working Draft 01. A conformant VWC carrying a `sha256:<hex>`
+    /// digest will be **rejected** by this function even when the underlying credential is
+    /// the one it genuinely witnesses. See [DTGCredential::digest_multibase] and README.md.
     pub fn verify_digest(&self, witnessed: &DTGCredential) -> Result<bool, DTGCredentialError> {
         let CredentialSubject::Witness(subject) = &self.credential.credential_subject else {
             return Ok(false);
@@ -322,8 +337,8 @@ impl TryFrom<&[String]> for DTGCredentialType {
 pub struct DTGCommon {
     /// JSON-LD links to contexts
     /// Must contain at least:
-    /// https://www.w3.org/ns/credentials/v2
-    /// https://firstperson.network/credentials/dtg/v1
+    /// - <https://www.w3.org/ns/credentials/v2>
+    /// - <https://firstperson.network/credentials/dtg/v1>
     #[serde(rename = "@context")]
     pub context: Vec<String>,
 

@@ -11,6 +11,31 @@ This library supports both W3C VC 1.1 and 2.0 specifications.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
+> [!WARNING]
+> **⚠️ KNOWN SPEC DIVERGENCE — VWC `digest` encoding ⚠️**
+>
+> This library does **not** encode the Witness Credential `digest` the way
+> Working Draft 01 specifies. **VWCs produced by this library will not
+> interoperate with spec-conformant implementations, in either direction.**
+>
+> | | Encoding | Example |
+> | --- | --- | --- |
+> | **WD-01 requires** | `sha256:` + lowercase hex | `sha256:e3b0c44298fc...` |
+> | **This library emits** | multibase multihash (base58btc) | `zQmbGXRT3v1Rm...` |
+>
+> The underlying hash is identical — SHA-256 over the JCS (RFC 8785) canonical
+> form — so **only the encoding differs**. The choice was made to match the W3C
+> `digestMultibase` convention used elsewhere in the VC ecosystem.
+>
+> Practical consequences:
+>
+> - `verify_digest()` will **reject** a conformant VWC from another implementation
+> - A conformant verifier will **reject** a VWC produced by this library
+>
+> This is unresolved and should be raised with the DTGWG for alignment. If your
+> deployment must interoperate with conformant implementations today, do not rely
+> on `digest_multibase()` / `verify_digest()`.
+
 ## Credential Type Hierarchy
 
 All credentials inherit from the abstract `DTGCredential`.
@@ -54,6 +79,11 @@ assert_eq!(vwc.task_context(), Some("thread-abc-123"));
 ```
 
 ## Witness Digests
+
+> [!WARNING]
+> The encoding used here diverges from Working Draft 01 and is **not
+> interoperable** with conformant implementations. See the warning at the top of
+> this README before relying on these functions.
 
 A VWC may bind itself to the VRC it witnesses via `credentialSubject.digest`.
 Compute it from the witnessed credential:
