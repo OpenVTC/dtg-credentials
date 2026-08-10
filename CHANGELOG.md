@@ -7,14 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `taskContext` property on `DTGCommon`, per the Trust Task Context Binding section of the
+  new specification. It is REQUIRED on a `WitnessCredential` and OPTIONAL elsewhere.
+  Previously this property was silently dropped on deserialization, which broke signing and
+  verification of any spec-conformant VWC: `sign()` serializes the credential, so a dropped
+  `taskContext` meant issuers signed a document missing the field and verifiers hashed a
+  different document than the one that was signed
+- `DTGCredential::task_context()` and `DTGCommon::task_context()` accessors
+- `DTGCredential::digest_multibase()`, computing the digest of a credential for use as the
+  `digest` of a Witness Credential attesting it
+- `DTGCredential::verify_digest()`, checking a VWC's `digest` against the credential it
+  claims to witness
+- `DTGCredentialError::MissingTaskContext` and `DTGCredentialError::Canonicalization`
+
 ### Changed
 
+- Tracked the [DTG Core Credentials specification](https://github.com/trustoverip/dtgwg-cred-spec)
+  v1.0 Working Draft 01, which supersedes the v0.3 proposal draft this library was built against
+- **BREAKING:** `DTGCredential::new_vwc()` takes a required `task_context: String` argument
+- **BREAKING:** Deserializing a `WitnessCredential` without a `taskContext` now fails with
+  `DTGCredentialError::MissingTaskContext`
 - `DTGCredential::sign()` is now an `async` method (breaking change) to align with upstream `affinidi-data-integrity` v0.5
 - Updated `affinidi-data-integrity` dependency from 0.4 to 0.5
 - Updated `affinidi-tdk` dev-dependency from 0.5 to 0.6
 - Relaxed `tokio` dev-dependency version from 1.49 to 1
 - Updated repository URL to `https://github.com/OpenVTC/dtg-credentials`
 - Enabled crate publishing (`publish = true`)
+
+### Deprecated
+
+- `DTGCredentialType::RCard`, `CredentialSubject::RCard`, `CredentialSubjectRCard` and
+  `DTGCredential::new_rcard()`. Working Draft 01 reclassifies the r-card as a verifiable data
+  structure (VDS) rather than a `DTGCredential` subtype, to be defined by the planned
+  *DTG Verifiable Data Structures* specification. These will be removed in a future release
+
+### Notes
+
+- **Divergence from Working Draft 01:** the specification requires the VWC `digest` to be
+  encoded as `sha256:` followed by a lowercase hex digest. This library instead uses a
+  multibase-encoded multihash (base58btc, `z...`), matching the W3C `digestMultibase`
+  convention used elsewhere in the VC ecosystem. The underlying hash — SHA-256 over the JCS
+  (RFC 8785) canonical form — is identical; only the encoding differs. This should be raised
+  with the DTGWG for alignment
 
 ## [0.1.1] - 2025-01-01
 

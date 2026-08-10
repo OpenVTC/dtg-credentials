@@ -2,6 +2,7 @@
 *   Builder methods for creating new entities.
 */
 
+#[allow(deprecated)]
 use crate::{
     CredentialSubject, CredentialSubjectBasic, CredentialSubjectEndorsement,
     CredentialSubjectRCard, CredentialSubjectWitness, DTGCommon, DTGCredential, DTGCredentialType,
@@ -164,17 +165,24 @@ impl DTGCredential {
     }
 
     /// Creates a new Verified Witness Credential (VWC)
-    /// issuer: The issuer DID of the credential
-    /// subject: The DID of the subject of this credential
+    /// issuer: The issuer DID of the credential - an M-DID, or the DID of a VTA acting
+    ///         according to VTC policy
+    /// subject: The DID of the observed party. For a witnessed bi-directional exchange this
+    ///          MUST be the issuer of the VRC that this VWC attests (the VRC referenced by
+    ///          `digest`), so that the two VWCs of an exchange are unambiguously bound to
+    ///          their respective directions. The witness should issue one VWC per direction.
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
-    /// digest: Optional Witness cryptographic hash of the witnessed VRC (prevents misuse)
+    /// task_context: Required `threadId` of the trust task exchange the witnessing occurred in
+    /// digest: Optional Witness cryptographic hash of the witnessed VRC (prevents misuse).
+    ///         Produce this with [DTGCredential::digest_multibase] on the witnessed VRC.
     /// witness_context: Optional Semantic context for the witness
     pub fn new_vwc(
         issuer: String,
         subject: String,
         valid_from: DateTime<Utc>,
         valid_until: Option<DateTime<Utc>>,
+        task_context: String,
         digest: Option<String>,
         witness_context: Option<WitnessContext>,
     ) -> Self {
@@ -182,6 +190,7 @@ impl DTGCredential {
             issuer,
             valid_from,
             valid_until,
+            task_context: Some(task_context),
             credential_subject: CredentialSubject::Witness(CredentialSubjectWitness {
                 id: subject,
                 digest,
@@ -205,6 +214,14 @@ impl DTGCredential {
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
     /// card: JSON Value representing a Jcard (RFC 7095) format
+    #[deprecated(
+        since = "0.2.0",
+        note = "The r-card is a verifiable data structure (VDS), not a DTGCredential subtype. \
+                It was removed from the DTG Core Credentials specification in Working Draft 01 \
+                and will be defined by the planned DTG Verifiable Data Structures specification. \
+                This constructor will be removed in a future release."
+    )]
+    #[allow(deprecated)]
     pub fn new_rcard(
         issuer: String,
         subject: String,
@@ -234,6 +251,7 @@ impl DTGCredential {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use crate::{DTGCredential, WitnessContext};
     use chrono::{DateTime, Utc};
@@ -452,7 +470,8 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
             None,
-            Some("sha256:test1234".to_string()),
+            "thread-abc-123".to_string(),
+            Some("zQmbGXRT3v1RmfWkQ7Y3Z5Uj9pKq2NcXhLd8sVtA4eB6nMw".to_string()),
             Some(WitnessContext {
                 event: Some("EthDenver 2024".to_string()),
                 session_id: Some("session-8822-nonce".to_string()),
@@ -474,9 +493,10 @@ mod tests {
   ],
   "issuer": "did:example:issuer",
   "validFrom": "2025-12-11T00:00:00Z",
+  "taskContext": "thread-abc-123",
   "credentialSubject": {
     "id": "did:example:subject",
-    "digest": "sha256:test1234",
+    "digest": "zQmbGXRT3v1RmfWkQ7Y3Z5Uj9pKq2NcXhLd8sVtA4eB6nMw",
     "witnessContext": {
       "event": "EthDenver 2024",
       "sessionId": "session-8822-nonce",
