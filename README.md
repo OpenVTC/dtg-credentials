@@ -1,6 +1,8 @@
 # Decentralized Trust Graph (DTG) Credentials
 
-**_NOTE:_** This is an early implementation to v0.3 of these [specifications](https://github.com/trustoverip/dtgwg-cred-tf).
+**_NOTE:_** This is an early implementation of the [DTG Core Credentials
+specification](https://github.com/trustoverip/dtgwg-cred-spec) (v1.0, Working
+Draft 01), which supersedes the earlier v0.3 proposal draft.
 
 See the [First Person Project Whitepaper](https://www.firstperson.network/white-paper)
 for more information.
@@ -21,8 +23,53 @@ VerifiableCredential
     ├── InvitationCredential (VIC)
     ├── PersonaCredential (VPC)
     ├── EndorsementCredential (VEC)
-    ├── WitnessCredential (VWC)
-    └── RelationshipCard (RCard) [VDS - not a credential]
+    └── WitnessCredential (VWC)
+```
+
+**_NOTE:_** The relationship card (R-Card) is **not** a `DTGCredential` subtype.
+Working Draft 01 reclassifies it as a verifiable data structure (VDS), to be
+defined by the planned *DTG Verifiable Data Structures* specification. The
+`RCard` type, `CredentialSubjectRCard` and `new_rcard()` are deprecated in this
+library and will be removed in a future release.
+
+## Trust Task Context
+
+Credentials issued inside a multi-step trust task exchange may carry a
+`taskContext` property holding the `threadId` of that exchange. It is REQUIRED
+on a `WitnessCredential` — deserializing a VWC without one fails with
+`DTGCredentialError::MissingTaskContext` — and OPTIONAL on every other type.
+
+A credential without a `taskContext` must be interpretable standing alone. A
+credential *with* one must not be read as proof that the trust task completed
+unless the matching outcome evidence is also present and verified.
+
+```Rust
+let vwc = DTGCredential::new_vwc(
+  issuer, subject, valid_from, valid_until,
+  "thread-abc-123".to_string(), // taskContext
+  digest, witness_context,
+);
+
+assert_eq!(vwc.task_context(), Some("thread-abc-123"));
+```
+
+## Witness Digests
+
+A VWC may bind itself to the VRC it witnesses via `credentialSubject.digest`.
+Compute it from the witnessed credential:
+
+```Rust
+let digest = vrc.digest_multibase()?;
+```
+
+This is the SHA-256 hash of the credential canonicalized with JCS (RFC 8785),
+wrapped as a multihash and encoded base58btc multibase (`z...`), matching the
+W3C `digestMultibase` convention. A verifier can check the binding with:
+
+```Rust
+if vwc.verify_digest(&vrc)? {
+  println!("VWC attests this VRC");
+}
 ```
 
 ## End to End Example
