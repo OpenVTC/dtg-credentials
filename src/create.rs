@@ -248,6 +248,44 @@ impl DTGCredential {
             version: crate::W3CVCVersion::V2_0,
         }
     }
+
+    /// Sets this credential's own identifier, consuming and returning it so it chains onto
+    /// any of the `new_*` constructors above.
+    ///
+    /// `id` MUST be a single URL per the W3C VC Data Model; `urn:uuid:<uuid>` is the usual
+    /// choice for a credential with no dereferenceable home. This crate does not validate it.
+    ///
+    /// ```
+    /// # use chrono::Utc;
+    /// # use dtg_credentials::DTGCredential;
+    /// let vmc = DTGCredential::new_vmc(
+    ///     "did:example:member".to_string(),
+    ///     "did:example:community".to_string(),
+    ///     Utc::now(),
+    ///     None,
+    ///     false,
+    /// )
+    /// .with_id("urn:uuid:2a4e1d90-6e0c-4d3f-9a4a-6d0a8f7c1b52");
+    /// assert_eq!(vmc.id(), Some("urn:uuid:2a4e1d90-6e0c-4d3f-9a4a-6d0a8f7c1b52"));
+    /// ```
+    ///
+    /// # Set it before signing
+    ///
+    /// A Data Integrity proof covers the credential minus its `proof`, so `id` is part of what
+    /// is signed. Chain this onto the constructor, before [DTGCredential::sign] — adding an id
+    /// to an already-signed credential leaves a document whose proof no longer verifies.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.credential.id = Some(id.into());
+        self
+    }
+
+    /// Sets this credential's own identifier in place.
+    ///
+    /// The non-consuming form of [DTGCredential::with_id]; the same "before signing" caveat
+    /// applies.
+    pub fn set_id(&mut self, id: impl Into<String>) {
+        self.credential.id = Some(id.into());
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +361,126 @@ mod tests {
 
         assert_eq!(txt, sample);
     }
+    /// `id` is OPTIONAL, and a credential that was never given one must keep serializing the
+    /// shape it always did — no `"id": null`, no empty string.
+    #[test]
+    fn test_vmc_without_id_omits_the_property() {
+        let vmc = DTGCredential::new_vmc(
+            "did:example:issuer".to_string(),
+            "did:example:subject".to_string(),
+            DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            None,
+            false,
+        );
+
+        assert_eq!(vmc.id(), None);
+        let value: serde_json::Value = serde_json::to_value(&vmc).unwrap();
+        assert!(
+            value.get("id").is_none(),
+            "an unset id must not appear on the wire at all: {value}"
+        );
+    }
+
+    /// `with_id` puts the identifier at the top level of the credential — a sibling of
+    /// `issuer`, not something nested under `credentialSubject` (which carries the *subject's*
+    /// id, a different thing entirely).
+    #[test]
+    fn test_vmc_with_id_serialization() {
+        let vmc = DTGCredential::new_vmc(
+            "did:example:issuer".to_string(),
+            "did:example:subject".to_string(),
+            DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            None,
+            false,
+        )
+        .with_id("urn:uuid:1e2d3c4b-5a69-4788-9099-aabbccddeeff");
+
+        let txt = serde_json::to_string_pretty(&vmc).unwrap();
+        let sample = r#"{
+  "@context": [
+    "https://www.w3.org/ns/credentials/v2",
+    "https://firstperson.network/credentials/dtg/v1"
+  ],
+  "type": [
+    "VerifiableCredential",
+    "DTGCredential",
+    "MembershipCredential"
+  ],
+  "id": "urn:uuid:1e2d3c4b-5a69-4788-9099-aabbccddeeff",
+  "issuer": "did:example:issuer",
+  "validFrom": "2025-12-11T00:00:00Z",
+  "credentialSubject": {
+    "id": "did:example:subject"
+  }
+}"#;
+
+        assert_eq!(txt, sample);
+    }
+
+    /// The identifier has to survive a round trip. It arrives on the wire and is read back
+    /// through `TryFrom<DTGCommon>`, which is where `taskContext` was previously being dropped
+    /// — a field that deserializes into nothing breaks signing and verification silently.
+    #[test]
+    fn test_id_round_trips_through_deserialization() {
+        let vmc = DTGCredential::new_vmc(
+            "did:example:issuer".to_string(),
+            "did:example:subject".to_string(),
+            Utc::now(),
+            None,
+            false,
+        )
+        .with_id("urn:uuid:1e2d3c4b-5a69-4788-9099-aabbccddeeff");
+
+        let txt = serde_json::to_string(&vmc).unwrap();
+        let parsed: DTGCredential = serde_json::from_str(&txt).unwrap();
+        assert_eq!(
+            parsed.id(),
+            Some("urn:uuid:1e2d3c4b-5a69-4788-9099-aabbccddeeff")
+        );
+    }
+
+    /// A credential with no `id` still deserializes — the property is OPTIONAL, and every
+    /// credential issued before this field existed has none.
+    #[test]
+    fn test_missing_id_deserializes_as_none() {
+        let parsed: DTGCredential = serde_json::from_str(
+            r#"{
+              "@context": ["https://www.w3.org/ns/credentials/v2"],
+              "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
+              "issuer": "did:example:issuer",
+              "validFrom": "2025-12-11T00:00:00Z",
+              "credentialSubject": { "id": "did:example:subject" }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.id(), None);
+    }
+
+    /// `set_id` is the in-place form of `with_id`; both write the same property.
+    #[test]
+    fn test_set_id_matches_with_id() {
+        let build = || {
+            DTGCredential::new_vrc(
+                "did:example:issuer".to_string(),
+                "did:example:subject".to_string(),
+                DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                None,
+            )
+        };
+        let mut in_place = build();
+        in_place.set_id("urn:uuid:abc");
+        assert_eq!(
+            serde_json::to_value(&in_place).unwrap(),
+            serde_json::to_value(build().with_id("urn:uuid:abc")).unwrap()
+        );
+    }
+
     #[test]
     fn test_vrc_serialization() {
         let vrc = DTGCredential::new_vrc(

@@ -104,6 +104,15 @@ impl DTGCredential {
         self.type_.clone()
     }
 
+    /// This credential's own identifier, if it has one.
+    ///
+    /// `None` for a credential built by one of the `new_*` constructors and never given one
+    /// with [DTGCredential::with_id]. See [DTGCommon::id] for why a counterparty may require
+    /// it.
+    pub fn id(&self) -> Option<&str> {
+        self.credential.id()
+    }
+
     /// Returns the Issuer DID
     pub fn issuer(&self) -> &str {
         self.credential.issuer()
@@ -349,6 +358,25 @@ pub struct DTGCommon {
     #[serde(rename = "type")]
     pub type_: Vec<String>,
 
+    /// OPTIONAL identifier for this specific credential, per the W3C VC Data Model.
+    ///
+    /// When present it MUST be a single URL. A `urn:uuid:` URN is the usual choice for a
+    /// credential with no dereferenceable home.
+    ///
+    /// This is the handle a holder or verifier stores the credential *under*, so it is what
+    /// makes re-delivery of the same credential idempotent and re-issuance of a different one
+    /// recognisable as a renewal rather than a duplicate. A counterparty that keys credentials
+    /// by `id` cannot accept one that has none — so issue with an `id` unless you know nobody
+    /// on the other side needs it.
+    ///
+    /// # Set it before signing
+    ///
+    /// A Data Integrity proof covers the credential minus its `proof`, which includes this
+    /// property. Set it while building — [DTGCredential::with_id] — never after
+    /// [DTGCredential::sign], which would leave a document whose proof no longer verifies.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub id: Option<String>,
+
     /// DID of the entity issuing this credential
     pub issuer: String,
 
@@ -391,6 +419,11 @@ impl DTGCommon {
     /// NOTE: This does NOT validate the proof itself
     pub fn signed(&self) -> bool {
         self.proof.is_some()
+    }
+
+    /// This credential's own identifier, if it has one. See [DTGCommon::id].
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
     }
 
     /// Returns the issuer DID
@@ -437,6 +470,7 @@ impl Default for DTGCommon {
                 "VerifiableCredential".to_string(),
                 "DTGCredential".to_string(),
             ],
+            id: None,
             issuer: String::new(),
             valid_from: Utc::now(),
             valid_until: None,
@@ -1360,6 +1394,47 @@ mod tests {
         assert!(
             cred.verify_proof_with_public_key(secret2.get_public_bytes())
                 .is_err()
+        );
+    }
+
+    /// The proof covers `id`, so it must be set *before* signing.
+    ///
+    /// This is the property that makes [DTGCredential::with_id]'s "set it before signing"
+    /// caveat load-bearing rather than advisory: a credential signed without an identifier
+    /// cannot be given one afterwards to satisfy a verifier that requires it, because the
+    /// document that was signed did not contain it. Tampering with `id` after the fact is
+    /// the same operation, and must fail the same way.
+    #[cfg(feature = "affinidi-signing")]
+    #[tokio::test]
+    async fn test_id_is_covered_by_the_proof() {
+        use affinidi_secrets_resolver::secrets::Secret;
+
+        let secret = Secret::generate_ed25519(None, None);
+
+        let mut cred = DTGCredential::new_vrc(
+            "did:example:issuer".to_string(),
+            "did:example:subject".to_string(),
+            Utc::now(),
+            None,
+        )
+        .with_id("urn:uuid:1e2d3c4b-5a69-4788-9099-aabbccddeeff");
+
+        cred.sign(&secret, Some(Utc::now()))
+            .await
+            .expect("signing a credential that carries an id");
+        assert!(
+            cred.verify_proof_with_public_key(secret.get_public_bytes())
+                .is_ok(),
+            "an id set before signing verifies"
+        );
+
+        // Changing the id after signing — which is what "splice an id into the JSON on the
+        // way out" amounts to — invalidates the proof.
+        cred.set_id("urn:uuid:00000000-0000-0000-0000-000000000000");
+        assert!(
+            cred.verify_proof_with_public_key(secret.get_public_bytes())
+                .is_err(),
+            "an id changed after signing must break the proof"
         );
     }
 

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-29
+
+### Added
+
+- `id` property on `DTGCommon`, the OPTIONAL top-level credential identifier of the W3C VC
+  Data Model. It was missing entirely, so a credential built with this library could not
+  carry one — and a counterparty that keys credentials by `id` had nothing to key on. Every
+  reciprocal `MembershipCredential` an OpenVTC member issued was rejected by the VTC for
+  exactly this reason, with the rejection arriving as a problem-report the member's client
+  discarded, so the failure was silent on both sides
+- `DTGCredential::with_id()` and `DTGCredential::set_id()` to set it while building, and
+  `DTGCredential::id()` / `DTGCommon::id()` to read it back. `id` is inside what a Data
+  Integrity proof covers, so it MUST be set before `sign()`; a test pins that (adding or
+  changing it afterwards invalidates the proof)
+
+### Changed
+
+- **BREAKING:** `DTGCommon` has a new public field. Construction through
+  `..Default::default()` (as every `new_*` constructor does) is unaffected; an exhaustive
+  struct literal will need the extra field
+
 ## [0.2.0] - 2026-08-10
 
 ### Added
