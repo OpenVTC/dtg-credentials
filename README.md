@@ -125,6 +125,34 @@ let vpc = DTGCredential::new_vpc(issuer, subject, valid_from, valid_to);
 The created `DTGCredential` can be serialized to JSON using `serde_json` allowing
 it to be passed into various signing libraries
 
+## Credential identifiers
+
+A credential may carry its own top-level `id` — the OPTIONAL identifier of the
+W3C VC Data Model, distinct from `credentialSubject.id`, which names the
+*subject*. When present it MUST be a single URL; `urn:uuid:<uuid>` is the usual
+choice for a credential with no dereferenceable home.
+
+The `new_*()` constructors leave it unset. Chain `with_id()` to add one:
+
+```Rust
+let vmc = DTGCredential::new_vmc(issuer, subject, valid_from, valid_to, false)
+  .with_id(format!("urn:uuid:{}", Uuid::new_v4()));
+
+assert_eq!(vmc.id(), Some(...));
+```
+
+Issue with an `id` unless you know no counterparty needs one. It is the handle a
+holder or verifier stores the credential *under*, so it is what makes
+re-delivery of the same credential idempotent, and re-issuance of a different
+one recognisable as a renewal rather than a duplicate. A verifier that keys
+credentials by `id` has no way to accept one that has none.
+
+> [!IMPORTANT]
+> Set the `id` **before** signing. A Data Integrity proof covers the credential
+> minus its `proof`, so the identifier is part of what is signed. Splicing one
+> into the JSON after `sign()` produces a document whose proof no longer
+> verifies.
+
 ## Signing credentials
 
 By default the `affinidi-signing` feature is enabled which allows you to sign a
