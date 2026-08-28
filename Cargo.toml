@@ -28,6 +28,6 @@ thiserror = "2.0"
 tracing = "0.1"
 
 [dev-dependencies]
-affinidi-tdk = "0.7"
+affinidi-tdk = "0.10"
 anyhow = "1.0"
 tokio = "1"
