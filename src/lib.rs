@@ -64,6 +64,15 @@ pub enum DTGCredentialError {
     /// The credential could not be canonicalized (JCS, RFC 8785) for digesting
     #[error("Could not canonicalize credential: {0}")]
     Canonicalization(String),
+
+    /// A credential was not of the type an operation requires
+    #[error("Expected a {expected}, got a {got}")]
+    WrongCredentialType { expected: String, got: String },
+
+    /// A membership acknowledgement was built against something that is not a
+    /// community-issued membership grant
+    #[error("Not a community-issued membership grant: {0}")]
+    NotAMembershipGrant(String),
 }
 
 /// Defined DTG Credentials
@@ -141,28 +150,66 @@ impl DTGCredential {
         self.credential.task_context()
     }
 
-    /// Computes the digest of this credential, for use as the `digest` property of a
-    /// Witness Credential (VWC) attesting it.
+    /// This credential's digest, as the `digest` property of a credential that references
+    /// it — a member-issued VMC acknowledging a membership grant, or a VWC attesting an
+    /// edge credential.
     ///
-    /// The digest is the SHA-256 hash of this credential canonicalized with the JSON
-    /// Canonicalization Scheme ([JCS, RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785)),
-    /// wrapped as a multihash and encoded as a base58btc multibase string (`z...`), matching
-    /// the W3C `digestMultibase` convention.
+    /// Per DTG Core Credentials, the digest is the SHA-256 hash of the credential's JSON
+    /// representation **excluding its top-level `proof` member**, canonicalized with the
+    /// JSON Canonicalization Scheme ([JCS, RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785)),
+    /// encoded as `sha256:` followed by the lowercase hexadecimal digest.
     ///
-    /// # ⚠️ Known spec divergence
+    /// # Why `proof` is excluded
     ///
-    /// This encoding is **not** what DTG Core Credentials Working Draft 01 specifies. WD-01
-    /// requires `sha256:` followed by a lowercase hex digest; this returns a multibase
-    /// multihash. The underlying hash is identical — only the encoding differs — but the
-    /// literal `digest` strings will not match, so **VWCs built with this value will not
-    /// interoperate with spec-conformant implementations**, and [DTGCredential::verify_digest]
-    /// will reject conformant VWCs from elsewhere.
+    /// The digest binds to what the credential *says*, not to a particular signature over
+    /// it. A referencing credential therefore survives a re-proofing of its referent: a
+    /// re-signed grant carrying identical claims still satisfies an acknowledgement made
+    /// against the earlier signature. It also means the digest can be computed before the
+    /// referent is signed, and is stable whichever of its proofs a holder happens to have.
+    pub fn digest(&self) -> Result<String, DTGCredentialError> {
+        let unsigned = DTGCommon {
+            proof: None,
+            ..self.credential.clone()
+        };
+
+        let canonical = serde_json_canonicalizer::to_vec(&unsigned)
+            .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
+
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity("sha256:".len() + 64);
+        out.push_str("sha256:");
+        for byte in Sha256::digest(&canonical) {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Ok(out)
+    }
+
+    /// The digest this credential carries of the credential it references, if it carries one.
     ///
-    /// This is unresolved and should be raised with the DTGWG. Do not rely on this function
-    /// if you must interoperate with conformant implementations today. See README.md.
+    /// `Some` for a member-issued VMC (which MUST carry one) and for a VWC bound to the edge
+    /// credential it attests; `None` for a community-issued VMC, which MUST omit it, and for
+    /// every credential type that has no `digest` property.
+    pub fn subject_digest(&self) -> Option<&str> {
+        match &self.credential.credential_subject {
+            CredentialSubject::Membership(subject) => subject.digest.as_deref(),
+            CredentialSubject::Witness(subject) => subject.digest.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Computes the digest of this credential in the multibase multihash encoding.
     ///
-    /// The digest covers the credential exactly as it stands, including its `proof` if it has
-    /// been signed. A witness should therefore digest the VRC in the form it was witnessed in.
+    /// The underlying hash differs from [DTGCredential::digest] in two ways: it is encoded as
+    /// a base58btc multibase multihash rather than `sha256:<hex>`, and it covers the
+    /// credential *including* its `proof`.
+    #[deprecated(
+        since = "0.4.0",
+        note = "This encoding is not what DTG Core Credentials specifies, so digests \
+                produced by it do not interoperate. Use DTGCredential::digest, which \
+                returns the conformant `sha256:<lowercase hex>` over the proofless JCS \
+                canonical form. This method will be removed in a future release."
+    )]
     pub fn digest_multibase(&self) -> Result<String, DTGCredentialError> {
         let canonical = serde_json_canonicalizer::to_vec(&self.credential)
             .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
@@ -175,27 +222,64 @@ impl DTGCredential {
         Ok(multibase::encode(Base::Base58Btc, &multihash))
     }
 
-    /// Checks that this credential's `digest` matches the credential it claims to witness.
+    /// Checks that this credential's `digest` matches the credential it claims to reference.
+    ///
+    /// Answers one question only — whether the hashes agree. It does not check that the two
+    /// credentials are of the types the reference requires, nor that their issuers and
+    /// subjects line up. For a membership acknowledgement, [DTGCredential::acknowledges]
+    /// checks all of that together and is what a verifier completing an edge should call.
     ///
     /// Returns `Ok(false)` if the digests do not match, or if this credential carries no
-    /// `digest` (it is OPTIONAL), in which case there is nothing to rely on.
-    ///
-    /// # ⚠️ Known spec divergence
-    ///
-    /// This compares against [DTGCredential::digest_multibase], whose encoding differs from
-    /// DTG Core Credentials Working Draft 01. A conformant VWC carrying a `sha256:<hex>`
-    /// digest will be **rejected** by this function even when the underlying credential is
-    /// the one it genuinely witnesses. See [DTGCredential::digest_multibase] and README.md.
-    pub fn verify_digest(&self, witnessed: &DTGCredential) -> Result<bool, DTGCredentialError> {
-        let CredentialSubject::Witness(subject) = &self.credential.credential_subject else {
+    /// `digest`, in which case there is nothing to rely on.
+    pub fn verify_digest(&self, referenced: &DTGCredential) -> Result<bool, DTGCredentialError> {
+        let Some(digest) = self.subject_digest() else {
             return Ok(false);
         };
 
-        let Some(digest) = &subject.digest else {
-            return Ok(false);
-        };
+        Ok(digest == referenced.digest()?)
+    }
 
-        Ok(*digest == witnessed.digest_multibase()?)
+    /// Does this member-issued VMC acknowledge `grant`, completing that membership edge?
+    ///
+    /// A membership edge is complete only when both VMCs of the pair exist and are valid:
+    /// the community-issued VMC that grants membership, and the member-issued VMC that
+    /// acknowledges it. This checks everything that binds the two together:
+    ///
+    /// 1. `grant` is a `MembershipCredential` carrying no `digest` — a community-issued grant
+    /// 2. `self` is a `MembershipCredential` carrying one — a member-issued acknowledgement
+    /// 3. the two name the same pair of parties, in mirrored roles: this credential's issuer
+    ///    is the grant's subject, and its subject is the grant's issuer
+    /// 4. the `digest` matches the grant
+    ///
+    /// Returns `Ok(false)` where any of those does not hold, rather than distinguishing
+    /// them: a caller deciding whether an edge is complete has one decision to make, and
+    /// every failing case answers it the same way.
+    ///
+    /// # What this does not check
+    ///
+    /// Neither credential's proof, and neither validity window. Both are the caller's to
+    /// verify — proof verification needs a resolver this crate does not hold, and whether a
+    /// window is current is a question about an instant the caller chooses. An edge is
+    /// complete when both VMCs are *valid* as well as bound, and this covers only the
+    /// binding.
+    pub fn acknowledges(&self, grant: &DTGCredential) -> Result<bool, DTGCredentialError> {
+        if !matches!(self.type_, DTGCredentialType::Membership)
+            || !matches!(grant.type_, DTGCredentialType::Membership)
+        {
+            return Ok(false);
+        }
+
+        // The grant is the half that MUST omit `digest`; a credential carrying one is an
+        // acknowledgement, and an acknowledgement of an acknowledgement is not an edge.
+        if grant.subject_digest().is_some() {
+            return Ok(false);
+        }
+
+        if self.issuer() != grant.subject() || self.subject() != grant.issuer() {
+            return Ok(false);
+        }
+
+        self.verify_digest(grant)
     }
 
     /// Returns the proof value if signed else None
@@ -438,6 +522,7 @@ impl DTGCommon {
             CredentialSubject::Basic(subject) => &subject.id,
             CredentialSubject::Endorsement(subject) => &subject.id,
             CredentialSubject::Witness(subject) => &subject.id,
+            CredentialSubject::Membership(subject) => &subject.id,
             CredentialSubject::RCard(subject) => &subject.id,
         }
     }
@@ -490,11 +575,46 @@ impl TryFrom<DTGCommon> for DTGCredential {
     #[allow(deprecated)]
     fn try_from(value: DTGCommon) -> Result<Self, Self::Error> {
         match &value.type_.as_slice().try_into()? {
-            DTGCredentialType::Membership => Ok(DTGCredential {
-                type_: DTGCredentialType::Membership,
-                version: value.context.as_slice().try_into()?,
-                credential: value,
-            }),
+            DTGCredentialType::Membership => {
+                // Normalize whichever variant the untagged subject match landed on into
+                // `Membership`, so a caller matching on the subject of a VMC sees one shape
+                // rather than two. See [CredentialSubject::Membership] for why the untagged
+                // match cannot make this decision itself.
+                let subject = match &value.credential_subject {
+                    // Already normalized — a credential built by `new_vmc` /
+                    // `new_member_vmc` rather than deserialized.
+                    CredentialSubject::Membership(subject) => subject.clone(),
+
+                    // `{ id }` — the community-issued grant, which MUST omit `digest`.
+                    CredentialSubject::Basic(subject) => CredentialSubjectMembership {
+                        id: subject.id.clone(),
+                        digest: None,
+                    },
+
+                    // `{ id, digest }` — the member-issued acknowledgement. Shape-identical
+                    // to a VWC subject, which wins the untagged match; on a
+                    // MembershipCredential it is this. A `witnessContext` alongside it is
+                    // not: that property belongs to a VWC and has no meaning here, so a VMC
+                    // carrying one is malformed rather than merely surprising.
+                    CredentialSubject::Witness(subject) if subject.witness_context.is_none() => {
+                        CredentialSubjectMembership {
+                            id: subject.id.clone(),
+                            digest: subject.digest.clone(),
+                        }
+                    }
+
+                    _ => return Err(DTGCredentialError::UnknownCredential),
+                };
+
+                Ok(DTGCredential {
+                    type_: DTGCredentialType::Membership,
+                    version: value.context.as_slice().try_into()?,
+                    credential: DTGCommon {
+                        credential_subject: CredentialSubject::Membership(subject),
+                        ..value
+                    },
+                })
+            }
             DTGCredentialType::Relationship => Ok(DTGCredential {
                 type_: DTGCredentialType::Relationship,
                 version: value.context.as_slice().try_into()?,
@@ -619,11 +739,30 @@ pub enum CredentialSubject {
     RCard(CredentialSubjectRCard),
 
     /// Credential Subject of just `id`
-    /// Use by  VMC, VRC, VIC and VPC
+    /// Used by a community-issued VMC, and by VRC, VIC and VPC
     Basic(CredentialSubjectBasic),
 
     /// Verifiable Witness Credential subject
     Witness(CredentialSubjectWitness),
+
+    /// Membership Credential subject, carrying the OPTIONAL `digest` that a member-issued
+    /// VMC MUST set.
+    ///
+    /// # Never selected by the untagged match, deliberately
+    ///
+    /// This variant sits last because its two shapes are already claimed above: `{ id }` is
+    /// [CredentialSubject::Basic], and `{ id, digest }` is indistinguishable from a VWC
+    /// subject with no `witnessContext`, which [CredentialSubject::Witness] takes first.
+    /// Nothing in the subject object itself separates a membership acknowledgement from a
+    /// witness attestation — only the credential's `type` does.
+    ///
+    /// So the shape is not decided here. `TryFrom<DTGCommon> for DTGCredential` normalizes
+    /// whichever variant the untagged match landed on into this one when `type` includes
+    /// `MembershipCredential`, the same way it already re-wraps a `Basic` subject as
+    /// `Witness` on a VWC. Deserialization is therefore deterministic rather than
+    /// order-dependent, and a `Membership` subject reaching a matcher has been through that
+    /// normalization.
+    Membership(CredentialSubjectMembership),
 }
 
 /// id of the credential subject only
@@ -631,6 +770,28 @@ pub enum CredentialSubject {
 #[serde(deny_unknown_fields)]
 pub struct CredentialSubjectBasic {
     pub id: String,
+}
+
+/// Membership Credential subject
+///
+/// The two directions of a membership edge share this shape and are told apart by
+/// `digest`: a community-issued VMC (the membership grant) MUST omit it, and a
+/// member-issued VMC (the membership acknowledgement) MUST carry it. Where both endpoints
+/// are C-DIDs, as in VTN membership, `digest` is the only discriminator — the issuer and
+/// subject rules cannot separate the directions.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialSubjectMembership {
+    pub id: String,
+
+    /// Digest of the community-issued VMC this acknowledges, as
+    /// [DTGCredential::digest] computes it.
+    ///
+    /// REQUIRED on the member-issued VMC, and MUST be omitted on the community-issued VMC.
+    /// `Option` rather than two structs because the same property distinguishes the two
+    /// directions: a type that could not represent both could not deserialize the pair.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub digest: Option<String>,
 }
 
 /// Endorsement Credential subject
@@ -689,8 +850,8 @@ pub struct CredentialSubjectRCard {
 #[allow(deprecated)]
 mod tests {
     use crate::{
-        CredentialSubject, CredentialSubjectRCard, DTGCommon, DTGCredential, DTGCredentialType,
-        W3CVCVersion,
+        CredentialSubject, CredentialSubjectRCard, DTGCommon, DTGCredential, DTGCredentialError,
+        DTGCredentialType, W3CVCVersion,
     };
     use chrono::{DateTime, Utc};
     use serde_json::Value;
@@ -721,7 +882,7 @@ mod tests {
         assert!(matches!(vmc.type_, DTGCredentialType::Membership));
         assert!(matches!(
             vmc.credential().credential_subject,
-            CredentialSubject::Basic(_)
+            CredentialSubject::Membership(_)
         ));
         assert!(matches!(vmc.version, W3CVCVersion::V1_1));
         assert!(matches!(vmc.get_w3c_vc_version(), W3CVCVersion::V1_1));
@@ -786,7 +947,7 @@ mod tests {
         assert!(matches!(vmc.type_, DTGCredentialType::Membership));
         assert!(matches!(
             vmc.credential().credential_subject,
-            CredentialSubject::Basic(_)
+            CredentialSubject::Membership(_)
         ));
         assert!(matches!(vmc.get_w3c_vc_version(), W3CVCVersion::V2_0));
     }
@@ -810,7 +971,7 @@ mod tests {
         assert!(matches!(vmc.type_, DTGCredentialType::Membership));
         assert!(matches!(
             vmc.credential().credential_subject,
-            CredentialSubject::Basic(_)
+            CredentialSubject::Membership(_)
         ));
     }
 
@@ -1304,7 +1465,7 @@ mod tests {
             valid_from,
             None,
             "thread-abc-123".to_string(),
-            Some(vrc.digest_multibase().unwrap()),
+            Some(vrc.digest().unwrap()),
             None,
         );
 
@@ -1345,6 +1506,322 @@ mod tests {
         );
 
         assert!(!vwc.verify_digest(&vrc).unwrap());
+    }
+
+    /// The digest encoding is the interoperability surface: a credential referencing another
+    /// is compared byte-for-byte against a string some other implementation produced. Pinned
+    /// against a literal rather than a recomputation, because a test that recomputes agrees
+    /// with whatever the code does and would follow the encoding silently if it drifted.
+    #[test]
+    fn test_digest_is_sha256_hex_over_the_proofless_jcs_form() {
+        let vmc = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            None,
+            false,
+        )
+        .with_id("urn:uuid:2a4e1d90-6e0c-4d3f-9a4a-6d0a8f7c1b52");
+
+        let digest = vmc.digest().unwrap();
+
+        let (scheme, hex) = digest.split_once(':').expect("`sha256:` prefixed");
+        assert_eq!(scheme, "sha256");
+        assert_eq!(hex.len(), 64, "32 bytes, hex encoded");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "lowercase hex only, got {hex}"
+        );
+
+        // Independently computed over the JCS canonical form of the credential above.
+        // Computed outside this crate over the JCS canonical form of the document above:
+        //   {"@context":[...],"credentialSubject":{"id":"did:example:member"},
+        //    "id":"urn:uuid:2a4e...","issuer":"did:example:community",
+        //    "type":[...],"validFrom":"2025-12-11T00:00:00Z"}
+        assert_eq!(
+            digest,
+            "sha256:49c9d5135ab4b5659a343bc79d351e37d64f05add58408cae6eef022828495c2"
+        );
+
+        // Stable across calls.
+        assert_eq!(digest, vmc.digest().unwrap());
+    }
+
+    /// The digest binds to what a credential says, not to a signature over it, so a
+    /// re-proofed credential still satisfies a reference made against the earlier one. This
+    /// is what lets a member's acknowledgement survive the community re-signing its grant.
+    #[cfg(feature = "affinidi-signing")]
+    #[tokio::test]
+    async fn test_digest_is_unchanged_by_signing() {
+        use affinidi_secrets_resolver::secrets::Secret;
+
+        let secret = Secret::generate_ed25519(None, None);
+
+        let mut vmc = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            Utc::now(),
+            None,
+            false,
+        );
+
+        let before = vmc.digest().unwrap();
+        vmc.sign(&secret, None).await.expect("signs");
+        assert!(vmc.signed());
+        assert_eq!(before, vmc.digest().unwrap());
+    }
+
+    /// The whole point of the pair: a grant and the acknowledgement built from it form a
+    /// complete membership edge, and the parties are mirrored across the two halves.
+    #[test]
+    fn test_member_vmc_acknowledges_its_grant() {
+        let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let grant = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            valid_from,
+            None,
+            false,
+        );
+
+        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+
+        // Roles reversed.
+        assert_eq!(ack.issuer(), "did:example:member");
+        assert_eq!(ack.subject(), "did:example:community");
+
+        // The grant MUST omit the digest; the acknowledgement MUST carry it.
+        assert_eq!(grant.subject_digest(), None);
+        assert_eq!(ack.subject_digest(), Some(grant.digest().unwrap().as_str()));
+
+        assert!(ack.acknowledges(&grant).unwrap());
+    }
+
+    /// An acknowledgement completes the edge it names and no other. Each case below verifies
+    /// as a credential in its own right; what fails is the binding.
+    #[test]
+    fn test_acknowledges_rejects_a_mismatched_pair() {
+        let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let grant = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            valid_from,
+            None,
+            false,
+        );
+        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+
+        // A grant to a different member: right community, wrong edge.
+        let other_member = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:someone-else".to_string(),
+            valid_from,
+            None,
+            false,
+        );
+        assert!(!ack.acknowledges(&other_member).unwrap());
+
+        // A grant from a different community.
+        let other_community = DTGCredential::new_vmc(
+            "did:example:other-community".to_string(),
+            "did:example:member".to_string(),
+            valid_from,
+            None,
+            false,
+        );
+        assert!(!ack.acknowledges(&other_community).unwrap());
+
+        // A re-issued grant to the same member — different claims, so a different digest.
+        // This is what forces re-acknowledgement on renewal rather than letting a stale
+        // consent carry over to a membership the member never agreed to.
+        let renewed = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            valid_from + chrono::Duration::days(365),
+            None,
+            false,
+        );
+        assert!(!ack.acknowledges(&renewed).unwrap());
+
+        // The acknowledgement is not itself a grant: acknowledging one forms no edge.
+        let ack_of_ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+        assert!(!ack_of_ack.acknowledges(&ack).unwrap());
+
+        // A grant on its own does not complete anything — it carries no digest to check.
+        assert!(!grant.acknowledges(&grant).unwrap());
+    }
+
+    /// `acknowledges` answers only about VMC pairs. A VRC edge is completed by its own
+    /// reciprocal, not by this.
+    #[test]
+    fn test_acknowledges_is_membership_only() {
+        let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let grant = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            valid_from,
+            None,
+            false,
+        );
+        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+
+        let vrc = DTGCredential::new_vrc(
+            "did:example:member".to_string(),
+            "did:example:community".to_string(),
+            valid_from,
+            None,
+        );
+        assert!(!ack.acknowledges(&vrc).unwrap());
+
+        // And a VWC bound to the grant is a witness attestation, not a member's consent.
+        let vwc = DTGCredential::new_vwc(
+            "did:example:witness".to_string(),
+            "did:example:community".to_string(),
+            valid_from,
+            None,
+            "thread-abc-123".to_string(),
+            Some(grant.digest().unwrap()),
+            None,
+        );
+        assert!(vwc.verify_digest(&grant).unwrap(), "the digest does match");
+        assert!(
+            !vwc.acknowledges(&grant).unwrap(),
+            "but a VWC is not the member's acknowledgement"
+        );
+    }
+
+    /// A grant built against something that cannot be one is refused at construction, where
+    /// the caller can still do something about it — rather than producing an acknowledgement
+    /// that verifies as a credential and completes no edge.
+    #[test]
+    fn test_new_member_vmc_refuses_a_non_grant() {
+        let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let vrc = DTGCredential::new_vrc(
+            "did:example:a".to_string(),
+            "did:example:b".to_string(),
+            valid_from,
+            None,
+        );
+        assert!(matches!(
+            DTGCredential::new_member_vmc(&vrc, valid_from, None),
+            Err(DTGCredentialError::WrongCredentialType { .. })
+        ));
+
+        let grant = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            valid_from,
+            None,
+            false,
+        );
+        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+        assert!(matches!(
+            DTGCredential::new_member_vmc(&ack, valid_from, None),
+            Err(DTGCredentialError::NotAMembershipGrant(_))
+        ));
+    }
+
+    /// `{ id, digest }` is shape-identical to a VWC subject, and the untagged enum matches
+    /// `Witness` first. On a MembershipCredential the credential's `type` is the only thing
+    /// that says otherwise, so the normalization in `TryFrom<DTGCommon>` is what makes this
+    /// deserialize as the member-issued half rather than as a witness attestation.
+    #[test]
+    fn test_member_issued_vmc_deserializes_as_membership_not_witness() {
+        let vmc: DTGCredential = serde_json::from_str(
+            r#"{
+                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
+                "issuer": "did:example:member",
+                "validFrom": "2024-06-18T10:00:00Z",
+                "credentialSubject": {
+                    "id": "did:example:community",
+                    "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                }
+            }"#,
+        )
+        .expect("deserializes");
+
+        assert!(matches!(vmc.type_, DTGCredentialType::Membership));
+        assert!(matches!(
+            vmc.credential().credential_subject,
+            CredentialSubject::Membership(_)
+        ));
+        assert_eq!(
+            vmc.subject_digest(),
+            Some("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        assert_eq!(vmc.subject(), "did:example:community");
+    }
+
+    /// `witnessContext` belongs to a VWC. A VMC carrying one is malformed rather than
+    /// merely surprising, and is refused instead of being silently read as a grant.
+    #[test]
+    fn test_membership_credential_rejects_a_witness_context() {
+        let result: Result<DTGCredential, _> = serde_json::from_str(
+            r#"{
+                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
+                "issuer": "did:example:member",
+                "validFrom": "2024-06-18T10:00:00Z",
+                "credentialSubject": {
+                    "id": "did:example:community",
+                    "digest": "sha256:e3b0c4",
+                    "witnessContext": { "event": "not a membership property" }
+                }
+            }"#,
+        );
+        assert!(result.is_err());
+    }
+
+    /// The two halves must be distinguishable on the wire by `digest` alone — that is the
+    /// only discriminator where both endpoints are C-DIDs, as in VTN membership.
+    #[test]
+    fn test_the_two_halves_round_trip_over_the_wire() {
+        let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let grant = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            valid_from,
+            None,
+            false,
+        );
+        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+
+        let grant_json = serde_json::to_value(&grant).unwrap();
+        assert!(
+            grant_json["credentialSubject"].get("digest").is_none(),
+            "the grant MUST omit `digest`: {grant_json}"
+        );
+
+        let ack_json = serde_json::to_value(&ack).unwrap();
+        assert_eq!(
+            ack_json["credentialSubject"]["digest"],
+            Value::String(grant.digest().unwrap()),
+        );
+
+        // And the pair still binds after a round trip through JSON, which is how each side
+        // actually receives the other's half.
+        let grant: DTGCredential = serde_json::from_value(grant_json).expect("grant round trips");
+        let ack: DTGCredential = serde_json::from_value(ack_json).expect("ack round trips");
+        assert!(ack.acknowledges(&grant).unwrap());
     }
 
     #[test]

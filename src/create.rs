@@ -5,20 +5,36 @@
 #[allow(deprecated)]
 use crate::{
     CredentialSubject, CredentialSubjectBasic, CredentialSubjectEndorsement,
-    CredentialSubjectRCard, CredentialSubjectWitness, DTGCommon, DTGCredential, DTGCredentialType,
-    WitnessContext,
+    CredentialSubjectMembership, CredentialSubjectRCard, CredentialSubjectWitness, DTGCommon,
+    DTGCredential, DTGCredentialError, DTGCredentialType, WitnessContext,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 impl DTGCredential {
-    /// Creates a new Verified Memebrship Credential (VMC)
-    /// issuer: The issuer DID of the credential
-    /// subject: The DID of the subject of this credential
+    /// Creates a new community-issued Verifiable Membership Credential (VMC) — the
+    /// membership **grant**, the community → member half of a membership edge.
+    ///
+    /// A membership edge is a *pair* of VMCs, and this is only one of them. The member
+    /// answers with [DTGCredential::new_member_vmc], and the edge is not complete until
+    /// they have: a community can always issue a credential naming somebody as a member,
+    /// but it cannot produce the acknowledgement without that party's signature. The pair
+    /// is what makes an unconsented membership claim unprovable.
+    ///
+    /// The grant MUST NOT carry a `digest` — that property is what marks the other
+    /// direction — and this constructor does not set one.
+    ///
+    /// issuer: The C-DID of the VTC or VTN granting membership
+    /// subject: The M-DID of the member, or the member VTC's C-DID for VTN membership
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
     /// personhood: Whether this VMC can be used as a form of Personhood Credential
     ///             - Adds PersonhoodCredential to the type array if true
+    ///
+    /// # Give it an `id`
+    ///
+    /// Chain [DTGCredential::with_id] on: the member stores the grant under its `id`, and
+    /// re-issuing is only recognisable as a renewal rather than a duplicate if there is one.
     pub fn new_vmc(
         issuer: String,
         subject: String,
@@ -30,7 +46,10 @@ impl DTGCredential {
             issuer,
             valid_from,
             valid_until,
-            credential_subject: CredentialSubject::Basic(CredentialSubjectBasic { id: subject }),
+            credential_subject: CredentialSubject::Membership(CredentialSubjectMembership {
+                id: subject,
+                digest: None,
+            }),
             ..Default::default()
         };
 
@@ -45,6 +64,85 @@ impl DTGCredential {
             type_: DTGCredentialType::Membership,
             version: crate::W3CVCVersion::V2_0,
         }
+    }
+
+    /// Creates a new member-issued Verifiable Membership Credential (VMC) — the membership
+    /// **acknowledgement**, the member → community half of a membership edge.
+    ///
+    /// The roles of [DTGCredential::new_vmc] are reversed (the member issues, the community
+    /// is the subject) and the subject carries a `digest` of the grant being acknowledged.
+    /// That digest is what binds the two halves into one edge: an acknowledgement whose
+    /// digest matches no valid grant does not complete anything, and the binding forces an
+    /// order — the grant must exist before this can reference it.
+    ///
+    /// This is the member's consent artifact. Because the member is its issuer, withdrawing
+    /// consent needs no cooperation from the community.
+    ///
+    /// grant: The community-issued VMC being acknowledged. Its subject is taken as the
+    ///        member and its issuer as the community, so the two halves cannot disagree
+    ///        about who they are between.
+    /// valid_from: The datetime from which this credential is valid
+    /// valid_until: Optional: The datetime this credential is valid until
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::WrongCredentialType] if `grant` is not a `MembershipCredential`,
+    /// and [DTGCredentialError::NotAMembershipGrant] if it already carries a `digest` — that
+    /// is an acknowledgement, and acknowledging one does not form an edge.
+    ///
+    /// # Digest the grant in the form you hold it
+    ///
+    /// The digest covers the grant's claims and not its `proof`, so this may be called
+    /// before or after the grant is signed and gives the same answer either way. What it
+    /// cannot survive is a grant whose *claims* differ — a re-issued grant carries a
+    /// different digest, which is what forces re-acknowledgement on renewal.
+    ///
+    /// # Give it an `id`
+    ///
+    /// As with the grant, chain [DTGCredential::with_id] on before signing. A community
+    /// keys a member's VMC by `id` to tell a re-send from a renewal.
+    pub fn new_member_vmc(
+        grant: &DTGCredential,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+    ) -> Result<Self, DTGCredentialError> {
+        if !matches!(grant.type_(), DTGCredentialType::Membership) {
+            return Err(DTGCredentialError::WrongCredentialType {
+                expected: DTGCredentialType::Membership.to_string(),
+                got: grant.type_().to_string(),
+            });
+        }
+
+        if grant.subject_digest().is_some() {
+            return Err(DTGCredentialError::NotAMembershipGrant(
+                "the credential carries a `digest`, so it is itself a member-issued \
+                 acknowledgement rather than a community-issued grant"
+                    .to_string(),
+            ));
+        }
+
+        // The member is the grant's subject and the community its issuer: reading both off
+        // the grant is what keeps the two halves naming the same pair. Taking them as
+        // parameters would let a caller acknowledge one grant while naming the parties of
+        // another, which verifies as a digest match and means nothing.
+        let mut vmc = DTGCommon {
+            issuer: grant.subject().to_string(),
+            valid_from,
+            valid_until,
+            credential_subject: CredentialSubject::Membership(CredentialSubjectMembership {
+                id: grant.issuer().to_string(),
+                digest: Some(grant.digest()?),
+            }),
+            ..Default::default()
+        };
+
+        vmc.type_.push(DTGCredentialType::Membership.to_string());
+
+        Ok(DTGCredential {
+            credential: vmc,
+            type_: DTGCredentialType::Membership,
+            version: crate::W3CVCVersion::V2_0,
+        })
     }
 
     /// Creates a new Verified Relationship Credential (VRC)
@@ -174,8 +272,11 @@ impl DTGCredential {
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
     /// task_context: Required `threadId` of the trust task exchange the witnessing occurred in
-    /// digest: Optional Witness cryptographic hash of the witnessed VRC (prevents misuse).
-    ///         Produce this with [DTGCredential::digest_multibase] on the witnessed VRC.
+    /// digest: Cryptographic hash of the witnessed edge credential, binding this VWC to the
+    ///         specific edge. Produce it with [DTGCredential::digest] on that credential.
+    ///         REQUIRED by the specification; `Option` here because a VWC that predates the
+    ///         requirement still has to deserialize. A VWC without one identifies the
+    ///         observed party and the exchange, but not which edge was witnessed.
     /// witness_context: Optional Semantic context for the witness
     pub fn new_vwc(
         issuer: String,
