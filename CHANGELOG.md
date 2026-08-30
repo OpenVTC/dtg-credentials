@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-30
+
+`new_member_vmc` in 0.4.0 took a parsed `DTGCredential` and digested it. That is wrong for
+the case it exists to serve. `DTGCommon` does not model `credentialStatus`, which every VMC
+issued against a status list carries, so parsing a *received* grant and re-serialising it
+drops that member — and the acknowledgement went out carrying a digest over a document the
+community never issued. Both credentials verify; only the digest comparison fails, with
+nothing in either to say why.
+
+### Added
+
+- `digest_json()`, the digest computed over a credential in its **wire form**. This is the
+  one to use for anything received. `DTGCredential::digest()` now delegates to it and is
+  documented as safe only for a credential built in-process
+
+### Changed
+
+- **BREAKING:** `DTGCredential::new_member_vmc()` takes the grant as `&serde_json::Value`
+  — the JSON the community sent — rather than a parsed `DTGCredential`, and reads the
+  member, the community and the digest from it. Its errors are now all
+  `NotAMembershipGrant`, naming which part of the document was missing or wrong
+
+
 ## [0.4.0] - 2026-08-30
 
 Membership is a **pair** of VMCs, and this release is what makes the second one

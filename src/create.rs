@@ -78,46 +78,67 @@ impl DTGCredential {
     /// This is the member's consent artifact. Because the member is its issuer, withdrawing
     /// consent needs no cooperation from the community.
     ///
-    /// grant: The community-issued VMC being acknowledged. Its subject is taken as the
-    ///        member and its issuer as the community, so the two halves cannot disagree
-    ///        about who they are between.
+    /// # Takes the grant in its wire form, deliberately
+    ///
+    /// `grant` is the JSON the community sent, not a parsed [DTGCredential]. The digest has
+    /// to cover the document the community will recompute it over, and this library does
+    /// not model every member a credential may carry — `credentialStatus`, which every VMC
+    /// issued against a status list carries, is dropped by a parse-then-re-serialise round
+    /// trip. Building the acknowledgement from a parsed grant would produce a digest that
+    /// verifies nowhere, and would do it silently.
+    ///
+    /// So: keep the bytes you were given, and pass them here.
+    ///
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
     ///
     /// # Errors
     ///
-    /// [DTGCredentialError::WrongCredentialType] if `grant` is not a `MembershipCredential`,
-    /// and [DTGCredentialError::NotAMembershipGrant] if it already carries a `digest` — that
-    /// is an acknowledgement, and acknowledging one does not form an edge.
-    ///
-    /// # Digest the grant in the form you hold it
-    ///
-    /// The digest covers the grant's claims and not its `proof`, so this may be called
-    /// before or after the grant is signed and gives the same answer either way. What it
-    /// cannot survive is a grant whose *claims* differ — a re-issued grant carries a
-    /// different digest, which is what forces re-acknowledgement on renewal.
+    /// [DTGCredentialError::NotAMembershipGrant] if `grant` is not a JSON object, does not
+    /// carry `MembershipCredential` in its `type`, has no `issuer` or
+    /// `credentialSubject.id`, or already carries a `digest` — that last is an
+    /// acknowledgement, and acknowledging one does not form an edge.
     ///
     /// # Give it an `id`
     ///
-    /// As with the grant, chain [DTGCredential::with_id] on before signing. A community
-    /// keys a member's VMC by `id` to tell a re-send from a renewal.
+    /// Chain [DTGCredential::with_id] on before signing. A community keys a member's VMC by
+    /// `id` to tell a re-send from a renewal.
     pub fn new_member_vmc(
-        grant: &DTGCredential,
+        grant: &Value,
         valid_from: DateTime<Utc>,
         valid_until: Option<DateTime<Utc>>,
     ) -> Result<Self, DTGCredentialError> {
-        if !matches!(grant.type_(), DTGCredentialType::Membership) {
-            return Err(DTGCredentialError::WrongCredentialType {
-                expected: DTGCredentialType::Membership.to_string(),
-                got: grant.type_().to_string(),
+        let object = grant
+            .as_object()
+            .ok_or_else(|| DTGCredentialError::NotAMembershipGrant("not a JSON object".into()))?;
+
+        let is_membership = object
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|types| {
+                types
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|t| t == "MembershipCredential")
             });
+        if !is_membership {
+            return Err(DTGCredentialError::NotAMembershipGrant(
+                "`type` does not include `MembershipCredential`".into(),
+            ));
         }
 
-        if grant.subject_digest().is_some() {
+        let subject = object
+            .get("credentialSubject")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                DTGCredentialError::NotAMembershipGrant("no `credentialSubject`".into())
+            })?;
+
+        if subject.contains_key("digest") {
             return Err(DTGCredentialError::NotAMembershipGrant(
                 "the credential carries a `digest`, so it is itself a member-issued \
                  acknowledgement rather than a community-issued grant"
-                    .to_string(),
+                    .into(),
             ));
         }
 
@@ -125,13 +146,31 @@ impl DTGCredential {
         // the grant is what keeps the two halves naming the same pair. Taking them as
         // parameters would let a caller acknowledge one grant while naming the parties of
         // another, which verifies as a digest match and means nothing.
+        let member = subject
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                DTGCredentialError::NotAMembershipGrant("no `credentialSubject.id`".into())
+            })?
+            .to_string();
+
+        // `issuer` is a string or an object with an `id`, per the W3C data model.
+        let community = object
+            .get("issuer")
+            .and_then(|i| {
+                i.as_str()
+                    .map(str::to_string)
+                    .or_else(|| i.get("id").and_then(Value::as_str).map(str::to_string))
+            })
+            .ok_or_else(|| DTGCredentialError::NotAMembershipGrant("no `issuer`".into()))?;
+
         let mut vmc = DTGCommon {
-            issuer: grant.subject().to_string(),
+            issuer: member,
             valid_from,
             valid_until,
             credential_subject: CredentialSubject::Membership(CredentialSubjectMembership {
-                id: grant.issuer().to_string(),
-                digest: Some(grant.digest()?),
+                id: community,
+                digest: Some(crate::digest_json(grant)?),
             }),
             ..Default::default()
         };

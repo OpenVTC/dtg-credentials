@@ -166,23 +166,25 @@ impl DTGCredential {
     /// re-signed grant carrying identical claims still satisfies an acknowledgement made
     /// against the earlier signature. It also means the digest can be computed before the
     /// referent is signed, and is stable whichever of its proofs a holder happens to have.
+    /// # ⚠️ Only for a credential this library built
+    ///
+    /// This digests the *model*, and the model does not carry every member a
+    /// credential may have — `credentialStatus`, for one, which every VMC issued
+    /// against a status list carries and which `DTGCommon` does not model. Digesting a
+    /// credential that was **received** rather than built here therefore hashes a
+    /// document with those members missing, producing a digest the sender will not
+    /// recognise.
+    ///
+    /// For a credential that arrived from somewhere else, digest the JSON you received
+    /// with [`digest_json`] — never a re-serialisation of a parse of it.
     pub fn digest(&self) -> Result<String, DTGCredentialError> {
         let unsigned = DTGCommon {
             proof: None,
             ..self.credential.clone()
         };
-
-        let canonical = serde_json_canonicalizer::to_vec(&unsigned)
+        let value = serde_json::to_value(&unsigned)
             .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
-
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity("sha256:".len() + 64);
-        out.push_str("sha256:");
-        for byte in Sha256::digest(&canonical) {
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        Ok(out)
+        digest_json(&value)
     }
 
     /// The digest this credential carries of the credential it references, if it carries one.
@@ -352,6 +354,53 @@ impl DTGCredential {
             false
         }
     }
+}
+
+/// The digest a DTG credential carries of another credential, computed over a
+/// credential in its **wire form**.
+///
+/// SHA-256 over the RFC 8785 (JCS) canonicalization of `doc` with its top-level `proof`
+/// member removed, encoded as `sha256:` followed by the lowercase hexadecimal digest.
+/// This is what a member-issued VMC carries of the grant it acknowledges, and what a VWC
+/// carries of the edge credential it attests.
+///
+/// # Digest what you received, not what you parsed
+///
+/// Take the document as it arrived. A credential may carry members this library does not
+/// model — `credentialStatus` is the common one — and a parse-then-re-serialise round
+/// trip drops them silently, so the digest would not match the one its issuer computed.
+/// [`DTGCredential::digest`] is safe only for a credential built in-process; anything
+/// received goes through this.
+///
+/// # Why `proof` is excluded
+///
+/// The digest binds to what the credential says, not to a signature over it, so a
+/// reference survives its referent being re-signed. A re-issued credential carries
+/// different claims and therefore a different digest, which is what makes renewal force
+/// re-acknowledgement.
+pub fn digest_json(doc: &Value) -> Result<String, DTGCredentialError> {
+    let proofless = match doc {
+        Value::Object(members) => {
+            let mut members = members.clone();
+            members.remove("proof");
+            Value::Object(members)
+        }
+        // Not an object: canonicalize as-is. A shape check belongs to the caller, which
+        // has a better error to give than this would.
+        other => other.clone(),
+    };
+
+    let canonical = serde_json_canonicalizer::to_vec(&proofless)
+        .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity("sha256:".len() + 64);
+    out.push_str("sha256:");
+    for byte in Sha256::digest(&canonical) {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(out)
 }
 
 /// TDG VC Type Identifiers
@@ -851,7 +900,7 @@ pub struct CredentialSubjectRCard {
 mod tests {
     use crate::{
         CredentialSubject, CredentialSubjectRCard, DTGCommon, DTGCredential, DTGCredentialError,
-        DTGCredentialType, W3CVCVersion,
+        DTGCredentialType, W3CVCVersion, digest_json,
     };
     use chrono::{DateTime, Utc};
     use serde_json::Value;
@@ -1574,6 +1623,11 @@ mod tests {
         assert_eq!(before, vmc.digest().unwrap());
     }
 
+    /// A grant in the wire form a member actually receives.
+    fn wire(c: &DTGCredential) -> Value {
+        serde_json::to_value(c.credential()).expect("credential serialises")
+    }
+
     /// The whole point of the pair: a grant and the acknowledgement built from it form a
     /// complete membership edge, and the parties are mirrored across the two halves.
     #[test]
@@ -1590,7 +1644,7 @@ mod tests {
             false,
         );
 
-        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
 
         // Roles reversed.
         assert_eq!(ack.issuer(), "did:example:member");
@@ -1618,7 +1672,7 @@ mod tests {
             None,
             false,
         );
-        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
 
         // A grant to a different member: right community, wrong edge.
         let other_member = DTGCredential::new_vmc(
@@ -1653,11 +1707,84 @@ mod tests {
         assert!(!ack.acknowledges(&renewed).unwrap());
 
         // The acknowledgement is not itself a grant: acknowledging one forms no edge.
-        let ack_of_ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+        let ack_of_ack =
+            DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
         assert!(!ack_of_ack.acknowledges(&ack).unwrap());
 
         // A grant on its own does not complete anything — it carries no digest to check.
         assert!(!grant.acknowledges(&grant).unwrap());
+    }
+
+    /// The bug this API shape exists to prevent.
+    ///
+    /// A real grant carries `credentialStatus` — every VMC issued against a status list
+    /// does — and `DTGCommon` does not model it, so a parse-then-re-serialise round trip
+    /// drops it. An acknowledgement built by digesting the *parsed* grant would carry a
+    /// digest over a document the community never issued, and the community would
+    /// rightly refuse it. Silently: both credentials verify, and only the digest
+    /// comparison fails, with nothing to say why.
+    ///
+    /// So `new_member_vmc` takes the wire form, and this pins that it digests what it
+    /// was handed rather than what it could parse.
+    #[test]
+    fn the_acknowledgement_digests_members_the_model_does_not_know() {
+        let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut grant = wire(&DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            valid_from,
+            None,
+            false,
+        ));
+        grant["credentialStatus"] = serde_json::json!({
+            "id": "https://community.example/status#7",
+            "type": "BitstringStatusListEntry",
+            "statusPurpose": "revocation",
+            "statusListIndex": "7"
+        });
+
+        // The parse drops it — this is the hazard, asserted rather than assumed.
+        let parsed: DTGCredential = serde_json::from_value(grant.clone()).expect("parses");
+        assert!(
+            wire(&parsed).get("credentialStatus").is_none(),
+            "the model is expected NOT to carry credentialStatus; if it now does, this \
+             test has stopped guarding anything and the API can be simplified"
+        );
+
+        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+
+        assert_eq!(
+            ack.subject_digest(),
+            Some(digest_json(&grant).unwrap().as_str()),
+            "the acknowledgement must digest the grant as received"
+        );
+        assert_ne!(
+            ack.subject_digest(),
+            Some(parsed.digest().unwrap().as_str()),
+            "digesting the parsed model would produce a digest the community cannot match"
+        );
+    }
+
+    /// `digest_json` and `digest` must agree for a credential with nothing outside the
+    /// model — otherwise the two entry points would quietly disagree for the easy case
+    /// too, and no caller could tell which to trust.
+    #[test]
+    fn digest_json_agrees_with_digest_where_the_model_is_complete() {
+        let vmc = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            None,
+            false,
+        )
+        .with_id("urn:uuid:2a4e1d90-6e0c-4d3f-9a4a-6d0a8f7c1b52");
+
+        assert_eq!(vmc.digest().unwrap(), digest_json(&wire(&vmc)).unwrap());
     }
 
     /// `acknowledges` answers only about VMC pairs. A VRC edge is completed by its own
@@ -1675,7 +1802,7 @@ mod tests {
             None,
             false,
         );
-        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
 
         let vrc = DTGCredential::new_vrc(
             "did:example:member".to_string(),
@@ -1718,8 +1845,8 @@ mod tests {
             None,
         );
         assert!(matches!(
-            DTGCredential::new_member_vmc(&vrc, valid_from, None),
-            Err(DTGCredentialError::WrongCredentialType { .. })
+            DTGCredential::new_member_vmc(&wire(&vrc), valid_from, None),
+            Err(DTGCredentialError::NotAMembershipGrant(_))
         ));
 
         let grant = DTGCredential::new_vmc(
@@ -1729,9 +1856,9 @@ mod tests {
             None,
             false,
         );
-        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
         assert!(matches!(
-            DTGCredential::new_member_vmc(&ack, valid_from, None),
+            DTGCredential::new_member_vmc(&wire(&ack), valid_from, None),
             Err(DTGCredentialError::NotAMembershipGrant(_))
         ));
     }
@@ -1803,7 +1930,7 @@ mod tests {
             None,
             false,
         );
-        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
 
         let grant_json = serde_json::to_value(&grant).unwrap();
         assert!(

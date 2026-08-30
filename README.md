@@ -60,8 +60,20 @@ it: a member-issued VMC digests the membership grant it acknowledges, and a VWC
 digests the edge credential it attests. Both use the same computation.
 
 ```Rust
+// A credential you received: digest the JSON as it arrived.
+let digest = dtg_credentials::digest_json(&grant_json)?;
+
+// A credential this library just built: `digest()` is equivalent.
 let digest = grant.digest()?;
 ```
+
+> [!IMPORTANT]
+> Digest what you **received**, not what you parsed. A credential may carry
+> members this library does not model — `credentialStatus` is the common one,
+> and every VMC issued against a status list has it — and a
+> parse-then-re-serialise round trip drops them silently. `digest()` is safe
+> only for a credential built in-process; anything that arrived from elsewhere
+> goes through `digest_json()`.
 
 That is `sha256:` followed by the lowercase hex SHA-256 of the credential
 canonicalized with JCS (RFC 8785), **excluding its top-level `proof`**. Leaving
@@ -108,9 +120,10 @@ let grant = DTGCredential::new_vmc(
 ).with_id(format!("urn:uuid:{}", Uuid::new_v4()));
 grant.sign(&community_key, None).await?;
 
-// Member side: acknowledge it. The parties are read off the grant, so the two
-// halves cannot disagree about who they are between.
-let mut ack = DTGCredential::new_member_vmc(&grant, Utc::now(), None)?
+// Member side: acknowledge it. `grant_json` is the JSON the community sent —
+// the wire form, not a parse of it. The parties are read off the grant, so the
+// two halves cannot disagree about who they are between.
+let mut ack = DTGCredential::new_member_vmc(&grant_json, Utc::now(), None)?
   .with_id(format!("urn:uuid:{}", Uuid::new_v4()));
 ack.sign(&member_key, None).await?;
 
