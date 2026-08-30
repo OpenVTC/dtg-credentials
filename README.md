@@ -11,31 +11,6 @@ This library supports both W3C VC 1.1 and 2.0 specifications.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
-> [!WARNING]
-> **⚠️ KNOWN SPEC DIVERGENCE — VWC `digest` encoding ⚠️**
->
-> This library does **not** encode the Witness Credential `digest` the way
-> Working Draft 01 specifies. **VWCs produced by this library will not
-> interoperate with spec-conformant implementations, in either direction.**
->
-> | | Encoding | Example |
-> | --- | --- | --- |
-> | **WD-01 requires** | `sha256:` + lowercase hex | `sha256:e3b0c44298fc...` |
-> | **This library emits** | multibase multihash (base58btc) | `zQmbGXRT3v1Rm...` |
->
-> The underlying hash is identical — SHA-256 over the JCS (RFC 8785) canonical
-> form — so **only the encoding differs**. The choice was made to match the W3C
-> `digestMultibase` convention used elsewhere in the VC ecosystem.
->
-> Practical consequences:
->
-> - `verify_digest()` will **reject** a conformant VWC from another implementation
-> - A conformant verifier will **reject** a VWC produced by this library
->
-> This is unresolved and should be raised with the DTGWG for alignment. If your
-> deployment must interoperate with conformant implementations today, do not rely
-> on `digest_multibase()` / `verify_digest()`.
-
 ## Credential Type Hierarchy
 
 All credentials inherit from the abstract `DTGCredential`.
@@ -78,29 +53,81 @@ let vwc = DTGCredential::new_vwc(
 assert_eq!(vwc.task_context(), Some("thread-abc-123"));
 ```
 
-## Witness Digests
+## Digests
 
-> [!WARNING]
-> The encoding used here diverges from Working Draft 01 and is **not
-> interoperable** with conformant implementations. See the warning at the top of
-> this README before relying on these functions.
-
-A VWC may bind itself to the VRC it witnesses via `credentialSubject.digest`.
-Compute it from the witnessed credential:
+An edge credential can be referenced by another credential through a `digest` of
+it: a member-issued VMC digests the membership grant it acknowledges, and a VWC
+digests the edge credential it attests. Both use the same computation.
 
 ```Rust
-let digest = vrc.digest_multibase()?;
+let digest = grant.digest()?;
 ```
 
-This is the SHA-256 hash of the credential canonicalized with JCS (RFC 8785),
-wrapped as a multihash and encoded base58btc multibase (`z...`), matching the
-W3C `digestMultibase` convention. A verifier can check the binding with:
+That is `sha256:` followed by the lowercase hex SHA-256 of the credential
+canonicalized with JCS (RFC 8785), **excluding its top-level `proof`**. Leaving
+`proof` out binds the digest to what the credential says rather than to one
+signature over it, so a reference survives its referent being re-signed, and the
+digest can be computed before signing.
+
+`verify_digest()` checks that a credential's digest matches the one it names:
 
 ```Rust
 if vwc.verify_digest(&vrc)? {
-  println!("VWC attests this VRC");
+  println!("this VWC attests that VRC");
 }
 ```
+
+For a membership pair, prefer `acknowledges()` — it checks the digest *and* that
+the two halves are of the right types and name the same parties in mirrored
+roles. See [Membership edges](#membership-edges).
+
+> [!NOTE]
+> `digest_multibase()` is deprecated. It emits a base58btc multibase multihash
+> over the credential *including* its proof, which is not what the specification
+> requires and does not interoperate. Use `digest()`.
+
+## Membership edges
+
+Membership is a **pair** of VMCs, not a single directed credential:
+
+| | `issuer` | `credentialSubject.id` | `digest` |
+| --- | --- | --- | --- |
+| **Community-issued** (the grant) | community C-DID | member M-DID | MUST be absent |
+| **Member-issued** (the acknowledgement) | member M-DID | community C-DID | MUST be present |
+
+The member-issued half is the member's *consent artifact*. A community can
+always issue a credential naming somebody as a member; what it cannot do is
+produce the acknowledgement, because that needs the member's signature. So an
+unconsented membership claim is unprovable — a community that cannot show the
+acknowledgement is visibly asserting a membership nobody agreed to.
+
+```Rust
+// Community side: grant membership.
+let grant = DTGCredential::new_vmc(
+  community_did, member_did, valid_from, valid_until, personhood,
+).with_id(format!("urn:uuid:{}", Uuid::new_v4()));
+grant.sign(&community_key, None).await?;
+
+// Member side: acknowledge it. The parties are read off the grant, so the two
+// halves cannot disagree about who they are between.
+let mut ack = DTGCredential::new_member_vmc(&grant, Utc::now(), None)?
+  .with_id(format!("urn:uuid:{}", Uuid::new_v4()));
+ack.sign(&member_key, None).await?;
+
+// Either side: is this edge complete?
+assert!(ack.acknowledges(&grant)?);
+```
+
+`acknowledges()` checks the binding — types, mirrored parties, and the digest.
+It deliberately does **not** check either credential's proof or validity window:
+proof verification needs a resolver this crate does not hold, and whether a
+window is current is a question about an instant the caller chooses. An edge is
+complete when both halves are valid *and* bound; this covers the binding.
+
+Because the digest covers the grant's claims, a **re-issued** grant carries a
+different digest and the earlier acknowledgement no longer matches it. Renewal
+therefore forces re-acknowledgement rather than letting a stale consent carry
+over to a membership the member never agreed to.
 
 ## End to End Example
 
