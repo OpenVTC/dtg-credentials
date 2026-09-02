@@ -4,9 +4,10 @@
 
 #[allow(deprecated)]
 use crate::{
-    CredentialSubject, CredentialSubjectBasic, CredentialSubjectEndorsement,
-    CredentialSubjectMembership, CredentialSubjectRCard, CredentialSubjectWitness, DTGCommon,
-    DTGCredential, DTGCredentialError, DTGCredentialType, WitnessContext,
+    AuthorityGrant, CredentialSubject, CredentialSubjectAuthority, CredentialSubjectBasic,
+    CredentialSubjectEndorsement, CredentialSubjectMembership, CredentialSubjectRCard,
+    CredentialSubjectWitness, DTGCommon, DTGCredential, DTGCredentialError, DTGCredentialType,
+    WitnessContext,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -236,6 +237,164 @@ impl DTGCredential {
         DTGCredential {
             credential: vic,
             type_: DTGCredentialType::Invitation,
+            version: crate::W3CVCVersion::V2_0,
+        }
+    }
+
+    /// Creates a new Verifiable Authority Credential (VAC) — a chain root.
+    ///
+    /// The issuer is the party governing `scope`. To derive a narrower VAC from one you
+    /// already hold, use [DTGCredential::attenuate] instead: a chain root is a grant made
+    /// by the governing party, and minting one directly is how a self-issued grant of
+    /// arbitrary authority gets in.
+    ///
+    /// `actions` MUST NOT be empty — an empty list confers nothing rather than everything.
+    ///
+    /// Tracks a draft (`trustoverip/dtgwg-cred-spec` PR #29); the shape may move.
+    pub fn new_vac(
+        issuer: String,
+        subject: String,
+        scope: String,
+        actions: Vec<String>,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+    ) -> Result<Self, DTGCredentialError> {
+        if actions.is_empty() {
+            return Err(DTGCredentialError::EmptyAuthorityActions);
+        }
+        let mut vac = DTGCommon {
+            issuer,
+            valid_from,
+            valid_until,
+            credential_subject: CredentialSubject::Authority(CredentialSubjectAuthority {
+                id: subject,
+                authority: AuthorityGrant {
+                    scope,
+                    actions,
+                    parent: None,
+                    audience: None,
+                },
+            }),
+            ..Default::default()
+        };
+
+        vac.type_.push(DTGCredentialType::Authority.to_string());
+
+        Ok(DTGCredential {
+            credential: vac,
+            type_: DTGCredentialType::Authority,
+            version: crate::W3CVCVersion::V2_0,
+        })
+    }
+
+    /// Derive a narrower VAC from one this holder already holds.
+    ///
+    /// This is what lets a member equip an agent, a device, or a short-lived session with
+    /// only the authority that task needs, rather than lending it their own. The derived
+    /// credential is issued by the *holder*, not by the party governing the scope, and
+    /// carries `parent` so a verifier can walk back to a root.
+    ///
+    /// Refuses anything that would widen. The checks here mirror
+    /// [crate::authority::verify_chain] on purpose: a holder should be unable to *build* a
+    /// chain a verifier would reject, so the failure surfaces at issue time rather than at
+    /// use — but the verifier's checks remain authoritative, because nothing stops a
+    /// different implementation constructing the JSON by hand.
+    ///
+    /// - `self` must be a VAC, and must carry an `id` (a parent with no identifier cannot
+    ///   be pointed at).
+    /// - `actions` must be a subset of what `self` confers.
+    /// - `valid_until` must not exceed `self`'s.
+    /// - `audience` binds the derived credential to one presenter; strongly recommended
+    ///   when equipping an agent, since it makes a leaked credential useless to anyone else.
+    pub fn attenuate(
+        &self,
+        subject: String,
+        actions: Vec<String>,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+        audience: Option<String>,
+    ) -> Result<Self, DTGCredentialError> {
+        let parent_grant = self
+            .credential()
+            .authority()
+            .ok_or(DTGCredentialError::NotAnAuthorityCredential)?;
+
+        let parent_id = self
+            .id()
+            .ok_or(DTGCredentialError::AttenuationParentHasNoId)?
+            .to_string();
+
+        if actions.is_empty() {
+            return Err(DTGCredentialError::EmptyAuthorityActions);
+        }
+        for action in &actions {
+            if !parent_grant.actions.contains(action) {
+                return Err(DTGCredentialError::AttenuationWidens(format!(
+                    "action `{action}` is not conferred by the parent"
+                )));
+            }
+        }
+        if let (Some(until), Some(parent_until)) = (valid_until, self.credential().valid_until())
+            && until > parent_until
+        {
+            return Err(DTGCredentialError::AttenuationWidens(format!(
+                "validUntil {until} is beyond the parent's {parent_until}"
+            )));
+        }
+
+        let mut vac = DTGCommon {
+            // The holder issues: they are the subject of the parent grant.
+            issuer: self.credential().subject().to_string(),
+            valid_from,
+            valid_until,
+            credential_subject: CredentialSubject::Authority(CredentialSubjectAuthority {
+                id: subject,
+                authority: AuthorityGrant {
+                    // Scope never changes down a chain.
+                    scope: parent_grant.scope.clone(),
+                    actions,
+                    parent: Some(parent_id),
+                    audience,
+                },
+            }),
+            ..Default::default()
+        };
+
+        vac.type_.push(DTGCredentialType::Authority.to_string());
+
+        Ok(DTGCredential {
+            credential: vac,
+            type_: DTGCredentialType::Authority,
+            version: crate::W3CVCVersion::V2_0,
+        })
+    }
+
+    /// Creates a new Verifiable Delegation Credential (VDC).
+    ///
+    /// Establishes that `subject` may act **in the issuer's name**. This is not authority:
+    /// a VDC never supplies permission the delegator did not itself hold, and a verifier
+    /// must settle the two questions separately. See [DTGCredential::new_vac].
+    ///
+    /// Tracks a draft (`trustoverip/dtgwg-cred-spec` PR #19); the shape may move.
+    pub fn new_vdc(
+        issuer: String,
+        subject: String,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+    ) -> Self {
+        let mut vdc = DTGCommon {
+            issuer,
+            valid_from,
+            valid_until,
+            credential_subject: CredentialSubject::Basic(CredentialSubjectBasic { id: subject }),
+            ..Default::default()
+        };
+
+        vdc.type_.push(DTGCredentialType::Delegation.to_string());
+
+        DTGCredential {
+            credential: vdc,
+            type_: DTGCredentialType::Delegation,
             version: crate::W3CVCVersion::V2_0,
         }
     }
