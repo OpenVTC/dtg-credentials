@@ -33,6 +33,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # affinidi-tdk (a dev-dependency) reaches the OS keyring, which links
+      # dbus and pcsclite. Only the jobs that build dev-dependencies need these
+      # — `cargo check` and `cargo package` do not, and stay lean.
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -42,6 +47,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # affinidi-tdk (a dev-dependency) reaches the OS keyring, which links
+      # dbus and pcsclite. Only the jobs that build dev-dependencies need these
+      # — `cargo check` and `cargo package` do not, and stay lean.
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
       - run: cargo test --all-features
 
   # The signing backend is optional and `default = ["affinidi-signing"]`, so the
@@ -54,6 +64,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # affinidi-tdk (a dev-dependency) reaches the OS keyring, which links
+      # dbus and pcsclite. Only the jobs that build dev-dependencies need these
+      # — `cargo check` and `cargo package` do not, and stay lean.
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
       - run: cargo test --no-default-features
 
   msrv:
