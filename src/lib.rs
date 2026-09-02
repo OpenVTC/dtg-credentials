@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Display;
 use thiserror::Error;
 
+pub mod authority;
 pub mod create;
 
 /// What W3C VC Format is the credential using?
@@ -56,6 +57,29 @@ pub enum DTGCredentialError {
 
     #[error("Unknown W3C VC Version")]
     UnknownVCVersion,
+
+    /// An AuthorityCredential (VAC) carried an empty `actions` list.
+    ///
+    /// Emptiness is never a wildcard: a VAC conferring no actions confers nothing, and is
+    /// rejected rather than treated as unrestricted.
+    #[error("AuthorityCredential carries an empty actions list, which confers nothing")]
+    EmptyAuthorityActions,
+
+    /// [DTGCredential::attenuate] was called on a credential that is not a VAC.
+    #[error("not an AuthorityCredential, so there is no authority to attenuate")]
+    NotAnAuthorityCredential,
+
+    /// [DTGCredential::attenuate] was called on a VAC with no `id`.
+    ///
+    /// A derived credential points at its parent by `id`; a parent without one cannot be
+    /// pointed at, so the chain could never be verified. Set one with
+    /// [DTGCredential::with_id] before attenuating.
+    #[error("cannot attenuate a credential with no id — the derived VAC could not name it")]
+    AttenuationParentHasNoId,
+
+    /// An attenuation attempted to confer more than its parent held.
+    #[error("attenuation would widen the parent grant: {0}")]
+    AttenuationWidens(String),
 
     /// A WitnessCredential (VWC) was missing the REQUIRED `taskContext` property
     #[error("WitnessCredential is missing the required taskContext property")]
@@ -414,6 +438,20 @@ pub enum DTGCredentialType {
     Endorsement,
     Witness,
 
+    /// Verifiable Authority Credential (VAC) — confers authority on a party to perform
+    /// specified actions within a named scope governed by the issuer.
+    ///
+    /// Tracks a draft: `trustoverip/dtgwg-cred-spec` PR #29. The shape may move before the
+    /// specification is approved.
+    Authority,
+
+    /// Verifiable Delegation Credential (VDC) — establishes that one entity may act in
+    /// another's name.
+    ///
+    /// Tracks a draft: `trustoverip/dtgwg-cred-spec` PR #19. The shape may move before the
+    /// specification is approved.
+    Delegation,
+
     /// R-Card is no longer a DTG credential type.
     #[deprecated(
         since = "0.2.0",
@@ -435,19 +473,23 @@ impl Display for DTGCredentialType {
             DTGCredentialType::Persona => write!(f, "PersonaCredential"),
             DTGCredentialType::Endorsement => write!(f, "EndorsementCredential"),
             DTGCredentialType::Witness => write!(f, "WitnessCredential"),
+            DTGCredentialType::Authority => write!(f, "AuthorityCredential"),
+            DTGCredentialType::Delegation => write!(f, "DelegationCredential"),
             DTGCredentialType::RCard => write!(f, "RCardCredential"),
         }
     }
 }
 
 /// This helps with matching the right credential type to the [DTGCredentialType]
-const DTG_TYPES: [&str; 7] = [
+const DTG_TYPES: [&str; 9] = [
     "MembershipCredential",
     "RelationshipCredential",
     "InvitationCredential",
     "PersonaCredential",
     "EndorsementCredential",
     "WitnessCredential",
+    "AuthorityCredential",
+    "DelegationCredential",
     "RCardCredential",
 ];
 
@@ -464,6 +506,8 @@ impl TryFrom<&[String]> for DTGCredentialType {
                 "PersonaCredential" => Ok(DTGCredentialType::Persona),
                 "EndorsementCredential" => Ok(DTGCredentialType::Endorsement),
                 "WitnessCredential" => Ok(DTGCredentialType::Witness),
+                "AuthorityCredential" => Ok(DTGCredentialType::Authority),
+                "DelegationCredential" => Ok(DTGCredentialType::Delegation),
                 "RCardCredential" => Ok(DTGCredentialType::RCard),
                 _ => Err(DTGCredentialError::UnknownCredential),
             }
@@ -572,7 +616,32 @@ impl DTGCommon {
             CredentialSubject::Endorsement(subject) => &subject.id,
             CredentialSubject::Witness(subject) => &subject.id,
             CredentialSubject::Membership(subject) => &subject.id,
+            CredentialSubject::Authority(subject) => &subject.id,
             CredentialSubject::RCard(subject) => &subject.id,
+        }
+    }
+
+    /// The `authority` grant, when this credential is a VAC.
+    ///
+    /// `None` for every other credential type — the accessor is deliberately fallible
+    /// rather than panicking, so a caller handed a credential of unknown type can ask
+    /// without first matching on `type_`.
+    pub fn authority(&self) -> Option<&AuthorityGrant> {
+        match &self.credential_subject {
+            CredentialSubject::Authority(subject) => Some(&subject.authority),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the `authority` grant, when this credential is a VAC.
+    ///
+    /// Present so that a caller can construct chains this library's own
+    /// [DTGCredential::attenuate] would refuse — which is exactly what a verifier must be
+    /// tested against, since nothing stops another implementation emitting such JSON.
+    pub fn authority_mut(&mut self) -> Option<&mut AuthorityGrant> {
+        match &mut self.credential_subject {
+            CredentialSubject::Authority(subject) => Some(&mut subject.authority),
+            _ => None,
         }
     }
 
@@ -724,6 +793,33 @@ impl TryFrom<DTGCommon> for DTGCredential {
                     _ => Err(DTGCredentialError::UnknownCredential),
                 }
             }
+            DTGCredentialType::Authority => {
+                // A VAC's subject must actually carry the grant. `Basic` — a bare `{ id }` —
+                // is the shape a caller lands on when the `authority` member is missing
+                // entirely, and a credential that confers nothing is malformed rather than
+                // merely empty. There is no normalization to do here (unlike VMC/VWC, whose
+                // shapes collide): `authority` is unique to this subject.
+                match &value.credential_subject {
+                    CredentialSubject::Authority(subject) => {
+                        if subject.authority.actions.is_empty() {
+                            // Emptiness is never a wildcard. Refusing here means a caller
+                            // cannot construct one by deserialization either.
+                            return Err(DTGCredentialError::EmptyAuthorityActions);
+                        }
+                        Ok(DTGCredential {
+                            type_: DTGCredentialType::Authority,
+                            version: value.context.as_slice().try_into()?,
+                            credential: value,
+                        })
+                    }
+                    _ => Err(DTGCredentialError::UnknownCredential),
+                }
+            }
+            DTGCredentialType::Delegation => Ok(DTGCredential {
+                type_: DTGCredentialType::Delegation,
+                version: value.context.as_slice().try_into()?,
+                credential: value,
+            }),
             DTGCredentialType::RCard => match &value.credential_subject {
                 CredentialSubject::RCard { .. } => Ok(DTGCredential {
                     type_: DTGCredentialType::RCard,
@@ -794,6 +890,13 @@ pub enum CredentialSubject {
     /// Verifiable Witness Credential subject
     Witness(CredentialSubjectWitness),
 
+    /// Verifiable Authority Credential subject.
+    ///
+    /// Unambiguous under the untagged match: no other DTG subject carries an `authority`
+    /// member, and `deny_unknown_fields` keeps a subject that does not have one from
+    /// landing here.
+    Authority(CredentialSubjectAuthority),
+
     /// Membership Credential subject, carrying the OPTIONAL `digest` that a member-issued
     /// VMC MUST set.
     ///
@@ -819,6 +922,60 @@ pub enum CredentialSubject {
 #[serde(deny_unknown_fields)]
 pub struct CredentialSubjectBasic {
     pub id: String,
+}
+
+/// The `authority` object a [CredentialSubject::Authority] carries.
+///
+/// # Attenuation
+///
+/// A holder may derive a narrower VAC from one they hold without involving the issuer. An
+/// attenuated VAC sets [AuthorityGrant::parent] to the `id` of the credential it derives
+/// from, and MUST NOT widen `actions`, `scope`, or the validity window. Verification walks
+/// the chain to a VAC issued by the party governing the scope — see
+/// [crate::authority::verify_chain], which is where the security of this credential
+/// actually lives. Issuing one is a struct and a signature; refusing a widening link is the
+/// part that matters.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityGrant {
+    /// The DID or URI the authority applies to.
+    ///
+    /// Matched exactly. A verifier rejects a VAC whose `scope` is not the resource being
+    /// accessed; nothing here implies containment between scopes.
+    pub scope: String,
+
+    /// The permitted actions, from a vocabulary the governing party defines.
+    ///
+    /// MUST NOT be empty. An empty list confers nothing — emptiness is never a wildcard,
+    /// which is the failure mode this rule exists to prevent. Action strings are compared
+    /// exactly and case-sensitively, and no action implies another: `admin` does not grant
+    /// `write` unless both are listed.
+    pub actions: Vec<String>,
+
+    /// The `id` of the VAC this one was attenuated from.
+    ///
+    /// Absent means this VAC was issued directly by the party governing the scope, and is
+    /// therefore a chain root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+
+    /// A DID that MUST be the presenter for this VAC to be accepted.
+    ///
+    /// Absent means any holder may present it. Setting it is what makes a leaked agent
+    /// credential useless to anyone but that agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+}
+
+/// Verifiable Authority Credential (VAC) subject.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialSubjectAuthority {
+    /// DID of the party receiving the authority.
+    pub id: String,
+
+    /// What the subject may do, and where.
+    pub authority: AuthorityGrant,
 }
 
 /// Membership Credential subject

@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-02
+
+Adds the two credentials that confer rather than assert: the **VAC** (verifiable authority
+credential) and the **VDC** (verifiable delegation credential). Both track drafts —
+`trustoverip/dtgwg-cred-spec` PR #29 and #19 respectively — and their shapes may move before
+those are approved. They are marked as such in the API docs.
+
+### Added
+
+- `DTGCredentialType::{Authority, Delegation}`, `CredentialSubject::Authority`, and the
+  `AuthorityGrant` object it carries: `scope`, `actions`, and the optional `parent` and
+  `audience` that make attenuation work.
+- `DTGCredential::{new_vac, new_vdc}`, following the existing `new_v*` constructors.
+- `DTGCredential::attenuate` — derive a narrower VAC from one you hold, without the issuer.
+  This is what lets a member equip an agent with four hours of read-only access instead of
+  lending it their own standing authority.
+- `authority::verify_chain` — **the part that matters.** Issuing a VAC is a struct and a
+  signature; what stops a holder acquiring authority they were never given is a verifier
+  refusing a chain that widens. Anyone can mint a well-formed VAC naming any scope and any
+  actions, and it will verify perfectly as a *credential*. What makes it worthless is that
+  its chain does not reach the party governing the scope.
+
+  Seven rules, each closing one way of getting more than was granted: the chain must reach a
+  root issued by the governing party; no link may add an action, widen scope, or outlive its
+  parent; each link's issuer must be its parent's subject (so a grant cannot be grafted onto
+  someone else's chain); `audience`, where set, must be the presenter; and depth is bounded
+  at 8, because verification is linear and runs on every presentation.
+
+- `DTGCommon::{authority, authority_mut}` accessors. The mutable one exists so tests can
+  build chains `attenuate` would refuse — nothing stops another implementation emitting such
+  JSON, so the verifier must be tested against it directly.
+
+### Notes
+
+- **Resolution is bearer-side.** `verify_chain` takes the whole chain as a slice and never
+  dereferences `parent` to fetch a link it was not given. Deliberate: resolving over the
+  network would make verification depend on availability, turn every `id` into a request the
+  verifier can be induced to make against an address the *holder* chooses, and signal
+  credential use to whoever hosts the identifier. `id` values are identifiers, not locators.
+- **An empty `actions` list confers nothing, not everything.** Refused by the constructor and
+  at the deserialization boundary, so it cannot be reached either way.
+- `DTGCredentialType` is `#[non_exhaustive]`, so the two new variants are not a breaking
+  change for callers matching with a wildcard arm. Callers matching exhaustively need one arm
+  each.
+
+
 ## [0.5.0] - 2026-08-30
 
 `new_member_vmc` in 0.4.0 took a parsed `DTGCredential` and digested it. That is wrong for
