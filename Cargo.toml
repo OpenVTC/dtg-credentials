@@ -31,3 +31,8 @@ tracing = "0.1"
 affinidi-tdk = "0.10"
 anyhow = "1.0"
 tokio = "1"
+# The `data_room` example seals records for real rather than pretending to. Dev-only:
+# nothing in the library itself encrypts, and adding a cipher to its dependency graph for
+# the sake of an example would be the wrong trade.
+chacha20poly1305 = "0.10"
+rand = "0.8"

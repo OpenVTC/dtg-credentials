@@ -11,6 +11,20 @@ This library supports both W3C VC 1.1 and 2.0 specifications.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
+## Examples
+
+```bash
+cargo run --example sign_and_verify   # create, sign, verify one credential
+cargo run --example data_room         # a whole data room, end to end
+```
+
+`data_room` runs the room story in one process with real DIDs, real signed credentials,
+real AEAD and real chain verification: a room issues its owner a VAC, invites a member by
+VIC, completes the VMC pair on their acknowledgement, seals a record, watches that member
+equip an **agent with strictly less authority than they hold themselves**, rotates the
+epoch on removal, and finally prints exactly what the host can see — which is ciphertext,
+an epoch number, and nothing else.
+
 ## Credential Type Hierarchy
 
 All credentials inherit from the abstract `DTGCredential`.
