@@ -36,3 +36,15 @@ tokio = "1"
 # the sake of an example would be the wrong trade.
 chacha20poly1305 = "0.10"
 rand = "0.8"
+
+# Both examples sign, and signing lives behind `affinidi-signing`. Without this
+# a `--no-default-features` build fails on the examples while the library it is
+# meant to be testing compiles perfectly - the failure names `.sign()`, not the
+# feature, so it reads as a missing method rather than a disabled backend.
+[[example]]
+name = "sign_and_verify"
+required-features = ["affinidi-signing"]
+
+[[example]]
+name = "data_room"
+required-features = ["affinidi-signing"]
