@@ -7,14 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Both examples now declare `required-features = ["affinidi-signing"]`. A
-  `--no-default-features` build previously failed on them while the library
-  itself compiled fine, and the error named `.sign()` rather than the disabled
-  backend
-
-## [0.6.0] - 2026-09-02
+## [0.6.0] - 2026-09-03
 
 Adds the two credentials that confer rather than assert: the **VAC** (verifiable authority
 credential) and the **VDC** (verifiable delegation credential). Both track drafts —
@@ -59,6 +52,12 @@ those are approved. They are marked as such in the API docs.
   change for callers matching with a wildcard arm. Callers matching exhaustively need one arm
   each.
 
+### Fixed
+
+- Both examples now declare `required-features = ["affinidi-signing"]`. A
+  `--no-default-features` build previously failed on them while the library
+  itself compiled fine, and the error named `.sign()` rather than the disabled
+  backend
 
 ## [0.5.0] - 2026-08-30
 
