@@ -4,11 +4,21 @@ name: CI
 # library - including `authority::verify_chain`, which is the part that decides
 # whether a holder acquired authority they were never granted - merged on local
 # runs alone. That is the gap this closes.
+#
+# Every third-party action is pinned to a full commit SHA, with the release it
+# corresponds to in a trailing comment that Dependabot keeps current. A tag or a
+# branch can be moved to point at different code; a commit cannot. The Rust
+# toolchain comes from the runner's own `rustup` rather than from an action that
+# tracks a branch.
 
 on:
   push:
     branches: [main]
   pull_request:
+
+# Nothing here writes to the repository, so no job is given a token that can.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,21 +28,27 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: rustfmt
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
       - run: cargo fmt --all --check
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # affinidi-tdk (a dev-dependency) reaches the OS keyring, which links
       # dbus and pcsclite. Only the jobs that build dev-dependencies need these
       # — `cargo check` and `cargo package` do not, and stay lean.
@@ -44,9 +60,14 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # affinidi-tdk (a dev-dependency) reaches the OS keyring, which links
       # dbus and pcsclite. Only the jobs that build dev-dependencies need these
       # — `cargo check` and `cargo package` do not, and stay lean.
@@ -61,9 +82,14 @@ jobs:
     name: No default features
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # affinidi-tdk (a dev-dependency) reaches the OS keyring, which links
       # dbus and pcsclite. Only the jobs that build dev-dependencies need these
       # — `cargo check` and `cargo package` do not, and stay lean.
@@ -75,8 +101,13 @@ jobs:
     name: Minimum Supported Rust Version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
       - run: cargo check --all-features
 
   # A crate that cannot be packaged cannot be released, and finding that out at
@@ -86,7 +117,12 @@ jobs:
     name: Package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo package --locked
