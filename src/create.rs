@@ -9,8 +9,31 @@ use crate::{
     CredentialSubjectRCard, CredentialSubjectWitness, DTGCommon, DTGCredential, DTGCredentialError,
     DTGCredentialType, DelegationGrant, WitnessContext,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use serde_json::Value;
+
+/// Refuses a validity window that closes before, or at the instant, it opens.
+///
+/// Only the ordering is checked. A `valid_from` in the past is legitimate — backdating is
+/// how a re-issued credential keeps the date the original took effect — and whether a
+/// window is current is a question about an instant the verifier chooses.
+///
+/// Both ends are compared at whole seconds, because that is all the wire form carries: a
+/// window a few hundred milliseconds wide in memory serializes as an empty one.
+pub(crate) fn check_window(
+    valid_from: DateTime<Utc>,
+    valid_until: Option<DateTime<Utc>>,
+) -> Result<(), DTGCredentialError> {
+    match valid_until {
+        Some(valid_until) if valid_until.trunc_subsecs(0) <= valid_from.trunc_subsecs(0) => {
+            Err(DTGCredentialError::InvalidValidityWindow {
+                valid_from,
+                valid_until,
+            })
+        }
+        _ => Ok(()),
+    }
+}
 
 impl DTGCredential {
     /// Creates a new community-issued Verifiable Membership Credential (VMC) — the
@@ -101,6 +124,9 @@ impl DTGCredential {
     /// `credentialSubject.id`, or already carries a `digest` — that last is an
     /// acknowledgement, and acknowledging one does not form an edge.
     ///
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`.
+    ///
     /// # Give it an `id`
     ///
     /// Chain [DTGCredential::with_id] on before signing. A community keys a member's VMC by
@@ -110,6 +136,8 @@ impl DTGCredential {
         valid_from: DateTime<Utc>,
         valid_until: Option<DateTime<Utc>>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, valid_until)?;
+
         let object = grant
             .as_object()
             .ok_or_else(|| DTGCredentialError::NotAMembershipGrant("not a JSON object".into()))?;
@@ -261,6 +289,11 @@ impl DTGCredential {
     /// here. Nothing about the subject's current standing is consulted when a VAC is
     /// verified, so authority that does not expire is authority nobody can withdraw by
     /// waiting.
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`, and [DTGCredentialError::EmptyAuthorityActions] if `actions` is empty.
     pub fn new_vac(
         issuer: String,
         subject: String,
@@ -269,6 +302,8 @@ impl DTGCredential {
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
         if actions.is_empty() {
             return Err(DTGCredentialError::EmptyAuthorityActions);
         }
@@ -441,6 +476,8 @@ impl DTGCredential {
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
         if actions.is_empty() {
             return Err(DTGCredentialError::EmptyAuthorityActions);
         }
@@ -525,7 +562,9 @@ impl DTGCredential {
     ///
     /// # Errors
     ///
-    /// [DTGCredentialError::MalformedDelegation] if `scope` is empty.
+    /// [DTGCredentialError::MalformedDelegation] if `scope` is empty, and
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`.
     pub fn new_vdc(
         issuer: String,
         subject: String,
@@ -534,6 +573,8 @@ impl DTGCredential {
         scope: Vec<String>,
         max_depth: Option<u32>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
         if scope.is_empty() {
             return Err(DTGCredentialError::MalformedDelegation(
                 "a grant MUST carry at least one `scope` entry — a VDC cannot express an \
@@ -586,6 +627,8 @@ impl DTGCredential {
     /// [DTGCredentialError::MalformedDelegation] if `self` is not a delegation grant, if
     /// it does not permit re-delegation, if `scope` is empty or not a subset of the
     /// parent's, or if `valid_until` is later than the parent's.
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`.
     pub fn redelegate(
         &self,
         subject: String,
@@ -647,6 +690,8 @@ impl DTGCredential {
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
         if parent_grant.accepts.is_some() {
             return Err(DTGCredentialError::MalformedDelegation(
                 "the parent is an acceptance, not a grant — an acceptance appoints nobody \
@@ -740,11 +785,16 @@ impl DTGCredential {
     /// `DelegationCredential` in its `type`, has no `issuer` or `credentialSubject.id`, or
     /// already carries `accepts` — that last is itself an acceptance, and accepting one
     /// forms no edge.
+    ///
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`.
     pub fn new_delegate_vdc(
         grant: &Value,
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
         let object = grant
             .as_object()
             .ok_or_else(|| DTGCredentialError::NotADelegationGrant("not a JSON object".into()))?;

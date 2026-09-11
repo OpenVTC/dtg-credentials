@@ -454,6 +454,55 @@ fn an_empty_scope_is_refused_at_construction() {
     );
 }
 
+/// A window that closes before, or as, it opens describes an appointment that is never in
+/// force. Every path that builds a VDC refuses one.
+#[test]
+fn an_inverted_window_is_refused_at_issue() {
+    let is_window_error =
+        |err: &DTGCredentialError| matches!(err, DTGCredentialError::InvalidValidityWindow { .. });
+
+    let err = DTGCredential::new_vdc(
+        ALICE.into(),
+        AGENT.into(),
+        t(24),
+        t(0),
+        vec!["schedule:read".into()],
+        None,
+    )
+    .unwrap_err();
+    assert!(is_window_error(&err), "got {err:?}");
+
+    let err = DTGCredential::new_vdc(
+        ALICE.into(),
+        AGENT.into(),
+        t(0),
+        t(0),
+        vec!["schedule:read".into()],
+        None,
+    )
+    .unwrap_err();
+    assert!(is_window_error(&err), "got {err:?}");
+
+    let root = root_delegation();
+    let err = root
+        .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(24), t(1))
+        .unwrap_err();
+    assert!(is_window_error(&err), "got {err:?}");
+
+    let err = DTGCredential::redelegate_from_json(
+        &wire(&root),
+        SUBAGENT.into(),
+        vec!["schedule:read".into()],
+        t(1),
+        t(1),
+    )
+    .unwrap_err();
+    assert!(is_window_error(&err), "got {err:?}");
+
+    let err = DTGCredential::new_delegate_vdc(&wire(&root), t(24), t(0)).unwrap_err();
+    assert!(is_window_error(&err), "got {err:?}");
+}
+
 /// ...nor by deserialization, which would otherwise bypass the constructor's guard.
 #[test]
 fn an_empty_scope_is_refused_on_deserialization() {

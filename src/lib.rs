@@ -129,6 +129,20 @@ pub enum DTGCredentialError {
     /// community-issued membership grant
     #[error("Not a community-issued membership grant: {0}")]
     NotAMembershipGrant(String),
+
+    /// A credential's `validUntil` is not after its `validFrom`.
+    ///
+    /// A window that closes before, or at the instant, it opens describes a credential
+    /// that is never valid. It is refused where a credential is built or signed rather than
+    /// left for every verifier to notice. A `validFrom` in the past is not refused:
+    /// backdating is how a re-issued credential keeps the date the original took effect.
+    ///
+    /// Compared at whole seconds, the precision the wire form carries.
+    #[error("validUntil {valid_until} is not after validFrom {valid_from}")]
+    InvalidValidityWindow {
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    },
 }
 
 /// Defined DTG Credentials
@@ -419,15 +433,39 @@ impl DTGCredential {
         }
     }
 
+    /// Checks the invariants this library holds a credential to before putting a proof on
+    /// it.
+    ///
+    /// - The validity window is well formed: `validUntil`, where present, is after
+    ///   `validFrom` ([DTGCredentialError::InvalidValidityWindow]).
+    ///
+    /// [DTGCredential::sign] calls this first, so this library never signs a credential
+    /// that fails it. The `new_*` constructors that return a plain `Self` have no way to
+    /// refuse, so a credential built by one of them is checked here rather than there. If
+    /// you sign with another backend, call this yourself before you do.
+    ///
+    /// A `validFrom` in the past is accepted. Backdating is legitimate — re-issuing a
+    /// credential with the date the original took effect is the usual case — so only the
+    /// ordering of the two ends is checked, never either end against the clock.
+    pub fn validate(&self) -> Result<(), DTGCredentialError> {
+        crate::create::check_window(self.valid_from(), self.valid_until())
+    }
+
     #[cfg(feature = "affinidi-signing")]
     /// Sign the credential using W3C Data Integrity Proof with JCS EdDSA 2022
     /// signing_secret: The secret key to use to sign the credential
     /// create_time: Optional creation time for the proof, defaults to now if None
+    ///
+    /// # Errors
+    ///
+    /// Anything [DTGCredential::validate] refuses, before any signing is attempted.
     pub async fn sign(
         &mut self,
         signing_secret: &Secret,
         create_time: Option<DateTime<Utc>>,
     ) -> Result<DataIntegrityProof, DTGCredentialError> {
+        self.validate()?;
+
         let mut options = SignOptions::new();
         if let Some(ts) = create_time {
             options = options.with_created(ts);
@@ -2889,5 +2927,85 @@ mod tests {
             }
             _ => panic!("Expected NotSigned error!"),
         }
+    }
+
+    /// The constructors that return a plain `Self` have no way to refuse a malformed
+    /// window, so `validate` is where one is caught for them.
+    #[test]
+    fn validate_refuses_an_inverted_window() {
+        let from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let vmc = |valid_from, valid_until| {
+            DTGCredential::new_vmc(
+                "did:example:community".to_string(),
+                "did:example:member".to_string(),
+                valid_from,
+                valid_until,
+                false,
+            )
+        };
+
+        assert!(matches!(
+            vmc(from, Some(from - chrono::Duration::hours(1))).validate(),
+            Err(DTGCredentialError::InvalidValidityWindow { .. })
+        ));
+        assert!(matches!(
+            vmc(from, Some(from)).validate(),
+            Err(DTGCredentialError::InvalidValidityWindow { .. })
+        ));
+
+        // Open-ended, and backdated, are both well formed.
+        assert!(vmc(from, None).validate().is_ok());
+        assert!(
+            vmc(from - chrono::Duration::days(3650), Some(from))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn new_member_vmc_refuses_an_inverted_window() {
+        let from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let grant = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            from,
+            None,
+            false,
+        );
+
+        assert!(matches!(
+            DTGCredential::new_member_vmc(
+                &wire(&grant),
+                from,
+                Some(from - chrono::Duration::hours(1))
+            ),
+            Err(DTGCredentialError::InvalidValidityWindow { .. })
+        ));
+    }
+
+    /// `sign` runs `validate` first, so this library never puts a proof on a credential
+    /// whose window is never open.
+    #[cfg(feature = "affinidi-signing")]
+    #[tokio::test]
+    async fn sign_refuses_an_inverted_window() {
+        use affinidi_secrets_resolver::secrets::Secret;
+
+        let secret = Secret::generate_ed25519(None, None);
+        let mut vrc = DTGCredential::new_vrc(
+            "did:example:issuer".to_string(),
+            "did:example:subject".to_string(),
+            Utc::now(),
+            Some(Utc::now() - chrono::Duration::days(1)),
+        );
+
+        assert!(matches!(
+            vrc.sign(&secret, None).await,
+            Err(DTGCredentialError::InvalidValidityWindow { .. })
+        ));
+        assert!(!vrc.signed(), "a refused credential must not carry a proof");
     }
 }
