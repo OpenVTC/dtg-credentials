@@ -49,7 +49,9 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 use chrono::{Duration, Utc};
-use dtg_credentials::{DTGCredential, authority::verify_chain, delegation};
+use dtg_credentials::{
+    DTGCredential, authority::verify_chain, delegation, verify_grant_with_public_key,
+};
 use rand::Rng;
 
 // ---------------------------------------------------------------------------------------
@@ -247,9 +249,17 @@ async fn main() -> Result<()> {
     grant.sign(&room_secret, None).await?;
 
     // The acknowledgement digests the grant's *wire* form — which is why the grant is
-    // serialized after signing and handed over as a `Value`.
+    // serialized after signing and handed over as a `Value`. Bob verifies it first: building
+    // an acknowledgement binds to a grant, and does not establish that the room signed it.
     let grant_wire = serde_json::to_value(&grant)?;
-    let mut ack = DTGCredential::new_member_vmc(&grant_wire, now, Some(now + Duration::days(30)))?;
+    verify_grant_with_public_key(&grant_wire, room_secret.get_public_bytes(), Utc::now())
+        .context("Bob must verify the room's grant before acknowledging it")?;
+    let mut ack = DTGCredential::new_member_vmc_for(
+        &grant_wire,
+        &bob_did,
+        now,
+        Some(now + Duration::days(30)),
+    )?;
     ack.sign(&bob_secret, None).await?;
 
     let mut bob_vac = DTGCredential::new_vac(
@@ -355,9 +365,15 @@ async fn main() -> Result<()> {
     // do is produce their signature. So the scheduler countersigns, taking on the
     // accountability that comes with acting in someone else's name.
     let grant_json = serde_json::to_value(appointment.credential())?;
-    let mut acceptance =
-        DTGCredential::new_delegate_vdc(&grant_json, now, now + Duration::days(30))?
-            .with_id("urn:uuid:vdc-scheduler-ack");
+    verify_grant_with_public_key(&grant_json, bob_secret.get_public_bytes(), Utc::now())
+        .context("the scheduler must verify Bob's appointment before accepting it")?;
+    let mut acceptance = DTGCredential::new_delegate_vdc_for(
+        &grant_json,
+        &scheduler_did,
+        now,
+        now + Duration::days(30),
+    )?
+    .with_id("urn:uuid:vdc-scheduler-ack");
     acceptance.sign(&scheduler_secret, None).await?;
 
     if !acceptance.accepts(&appointment)? {

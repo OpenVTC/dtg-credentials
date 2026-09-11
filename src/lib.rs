@@ -151,6 +151,40 @@ pub enum DTGCredentialError {
     /// work starts.
     #[error("JSON is nested more than {max} levels deep")]
     JsonTooDeep { max: usize },
+
+    /// A grant names a different party as its subject from the one answering it.
+    ///
+    /// Returned by [DTGCredential::new_member_vmc_for] and
+    /// [DTGCredential::new_delegate_vdc_for]. A party answers a grant for itself, so a grant
+    /// naming anyone else is refused rather than answered in that party's name.
+    #[error("the grant names `{found}` as its subject, not `{expected}`")]
+    NotTheGrantSubject { expected: String, found: String },
+
+    /// An acknowledgement or acceptance would remain valid after the grant it answers.
+    ///
+    /// `valid_until` is `None` where the answer was open-ended against a grant that expires.
+    #[error("would remain valid after the grant it answers, which expires at {grant_valid_until}")]
+    OutlivesGrant {
+        valid_until: Option<DateTime<Utc>>,
+        grant_valid_until: DateTime<Utc>,
+    },
+
+    /// A proof verified, but was made with a verification method that does not belong to
+    /// the credential's issuer.
+    #[error("the proof was made by `{verification_method}`, which is not the issuer `{issuer}`")]
+    ProofNotFromIssuer {
+        issuer: String,
+        verification_method: String,
+    },
+
+    /// A credential was not in force at the instant it was checked against.
+    #[error("the credential is not valid at {at}")]
+    NotValidAt { at: DateTime<Utc> },
+
+    /// A credential in its wire form lacks a member it needs, or carries one that cannot be
+    /// read.
+    #[error("malformed credential: {0}")]
+    MalformedCredential(String),
 }
 
 /// Defined DTG Credentials
@@ -370,6 +404,17 @@ impl DTGCredential {
     /// window is current is a question about an instant the caller chooses. An edge is
     /// complete when both VMCs are *valid* as well as bound, and this covers only the
     /// binding.
+    ///
+    /// # Security
+    ///
+    /// `Ok(true)` is binding evidence, not membership. A pair binds whether or not anybody
+    /// signed either half: an acknowledgement can be built against a grant the community
+    /// never issued, and this accepts the two together. Before treating an edge as complete,
+    /// verify the grant's proof against the community's key and the acknowledgement's
+    /// against the member's — each made by a verification method of that credential's
+    /// issuer — and check both windows at the instant you care about.
+    /// `verify_grant_with_public_key`, under the `affinidi-signing` feature, does that for
+    /// the grant in its wire form.
     pub fn acknowledges(&self, grant: &DTGCredential) -> Result<bool, DTGCredentialError> {
         if !matches!(self.type_, DTGCredentialType::Membership)
             || !matches!(grant.type_, DTGCredentialType::Membership)
@@ -412,6 +457,12 @@ impl DTGCredential {
     /// status. Nor does it establish that the *delegator* may perform the act in question
     /// — that is a separate question, asked of the delegator at the time of the act, which
     /// a VDC moves but never answers. This covers the binding.
+    ///
+    /// # Security
+    ///
+    /// As with [DTGCredential::acknowledges], `Ok(true)` is binding evidence only. Verify
+    /// both proofs, each against a verification method of its own credential's issuer, and
+    /// both windows, before accepting anybody as acting under the delegation.
     pub fn accepts(&self, grant: &DTGCredential) -> Result<bool, DTGCredentialError> {
         if !matches!(self.type_, DTGCredentialType::Delegation)
             || !matches!(grant.type_, DTGCredentialType::Delegation)
@@ -682,6 +733,83 @@ pub fn digest_multibase_json(doc: &Value) -> Result<String, DTGCredentialError> 
     multihash.extend_from_slice(&digest);
 
     Ok(multibase::encode(Base::Base58Btc, &multihash))
+}
+
+/// Verifies a grant **in its wire form** before it is answered: that its issuer signed it,
+/// and that it is in force at `at`.
+///
+/// Call this on the JSON a community or delegator sent, before passing that JSON to
+/// [DTGCredential::new_member_vmc_for] or [DTGCredential::new_delegate_vdc_for]. Those
+/// constructors bind an answer to a grant; they do not establish that anybody signed it.
+///
+/// Checks, in order:
+///
+/// 1. the document is within [`MAX_JSON_DEPTH`] and carries a `proof`, else
+///    [DTGCredentialError::JsonTooDeep] or [DTGCredentialError::NotSigned];
+/// 2. the proof verifies under `public_key` over the document with its top-level `proof`
+///    removed, else [DTGCredentialError::DataIntegrity];
+/// 3. the proof's `verificationMethod` belongs to the grant's `issuer` — the DID before its
+///    `#` fragment is exactly the issuer — else [DTGCredentialError::ProofNotFromIssuer];
+/// 4. the validity window is well formed and contains `at`, else
+///    [DTGCredentialError::InvalidValidityWindow] or [DTGCredentialError::NotValidAt].
+///
+/// A document with no `issuer` or `validFrom`, or with a timestamp or a single `proof` that
+/// cannot be read, is [DTGCredentialError::MalformedCredential].
+///
+/// # Where `public_key` comes from
+///
+/// Resolve it from the issuer's DID document, for the verification method the proof names,
+/// and confirm that method is authorized for assertion. Step 3 ties the proof to the issuer
+/// only as far as the key does: a key taken from the grant itself, or from whoever sent it,
+/// establishes nothing about the issuer.
+///
+/// # What this does not check
+///
+/// Revocation — a `credentialStatus` entry is not resolved — and the grant's shape beyond
+/// the members read above. The constructors check the shape.
+#[cfg(feature = "affinidi-signing")]
+pub fn verify_grant_with_public_key(
+    grant: &Value,
+    public_key: &[u8],
+    at: DateTime<Utc>,
+) -> Result<(), DTGCredentialError> {
+    check_json_depth(grant)?;
+
+    let object = grant
+        .as_object()
+        .ok_or_else(|| DTGCredentialError::MalformedCredential("not a JSON object".into()))?;
+    let Some(proof) = object.get("proof") else {
+        return Err(DTGCredentialError::NotSigned);
+    };
+    let proof: DataIntegrityProof = serde_json::from_value(proof.clone())
+        .map_err(|e| DTGCredentialError::MalformedCredential(format!("unreadable `proof`: {e}")))?;
+
+    proof.verify_with_public_key(&proofless(grant), public_key, VerifyOptions::new())?;
+
+    let issuer = create::issuer_of(object)
+        .ok_or_else(|| DTGCredentialError::MalformedCredential("no `issuer`".into()))?;
+    let method_did = proof
+        .verification_method
+        .split_once('#')
+        .map_or(proof.verification_method.as_str(), |(did, _)| did);
+    if method_did != issuer {
+        return Err(DTGCredentialError::ProofNotFromIssuer {
+            issuer,
+            verification_method: proof.verification_method,
+        });
+    }
+
+    let valid_from = create::read_timestamp(object, "validFrom", "issuanceDate")
+        .map_err(DTGCredentialError::MalformedCredential)?
+        .ok_or_else(|| DTGCredentialError::MalformedCredential("no `validFrom`".into()))?;
+    let valid_until = create::read_timestamp(object, "validUntil", "expirationDate")
+        .map_err(DTGCredentialError::MalformedCredential)?;
+    create::check_window(valid_from, valid_until)?;
+    if valid_from > at || valid_until.is_some_and(|until| until < at) {
+        return Err(DTGCredentialError::NotValidAt { at });
+    }
+
+    Ok(())
 }
 
 /// Decodes a `digestMultibase` value into the algorithm it names and the raw digest bytes.
@@ -2461,7 +2589,13 @@ mod tests {
             false,
         );
 
-        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc_for(
+            &wire(&grant),
+            "did:example:member",
+            valid_from,
+            None,
+        )
+        .expect("builds");
 
         // Roles reversed.
         assert_eq!(ack.issuer(), "did:example:member");
@@ -2492,7 +2626,13 @@ mod tests {
             None,
             false,
         );
-        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc_for(
+            &wire(&grant),
+            "did:example:member",
+            valid_from,
+            None,
+        )
+        .expect("builds");
 
         // A grant to a different member: right community, wrong edge.
         let other_member = DTGCredential::new_vmc(
@@ -2527,8 +2667,13 @@ mod tests {
         assert!(!ack.acknowledges(&renewed).unwrap());
 
         // The acknowledgement is not itself a grant: acknowledging one forms no edge.
-        let ack_of_ack =
-            DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
+        let ack_of_ack = DTGCredential::new_member_vmc_for(
+            &wire(&grant),
+            "did:example:member",
+            valid_from,
+            None,
+        )
+        .expect("builds");
         assert!(!ack_of_ack.acknowledges(&ack).unwrap());
 
         // A grant on its own does not complete anything — it carries no digest to check.
@@ -2730,7 +2875,8 @@ mod tests {
              verbatim, this test has stopped guarding anything"
         );
 
-        let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc_for(&grant, "did:example:member", valid_from, None)
+            .expect("builds");
 
         assert_eq!(
             ack.subject_digest(),
@@ -2778,7 +2924,13 @@ mod tests {
             None,
             false,
         );
-        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc_for(
+            &wire(&grant),
+            "did:example:member",
+            valid_from,
+            None,
+        )
+        .expect("builds");
 
         let vrc = DTGCredential::new_vrc(
             "did:example:member".to_string(),
@@ -2821,7 +2973,7 @@ mod tests {
             None,
         );
         assert!(matches!(
-            DTGCredential::new_member_vmc(&wire(&vrc), valid_from, None),
+            DTGCredential::new_member_vmc_for(&wire(&vrc), "did:example:b", valid_from, None),
             Err(DTGCredentialError::NotAMembershipGrant(_))
         ));
 
@@ -2832,9 +2984,20 @@ mod tests {
             None,
             false,
         );
-        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc_for(
+            &wire(&grant),
+            "did:example:member",
+            valid_from,
+            None,
+        )
+        .expect("builds");
         assert!(matches!(
-            DTGCredential::new_member_vmc(&wire(&ack), valid_from, None),
+            DTGCredential::new_member_vmc_for(
+                &wire(&ack),
+                "did:example:community",
+                valid_from,
+                None
+            ),
             Err(DTGCredentialError::NotAMembershipGrant(_))
         ));
     }
@@ -2906,7 +3069,13 @@ mod tests {
             None,
             false,
         );
-        let ack = DTGCredential::new_member_vmc(&wire(&grant), valid_from, None).expect("builds");
+        let ack = DTGCredential::new_member_vmc_for(
+            &wire(&grant),
+            "did:example:member",
+            valid_from,
+            None,
+        )
+        .expect("builds");
 
         let grant_json = serde_json::to_value(&grant).unwrap();
         assert!(
@@ -3108,8 +3277,9 @@ mod tests {
         );
 
         assert!(matches!(
-            DTGCredential::new_member_vmc(
+            DTGCredential::new_member_vmc_for(
                 &wire(&grant),
+                "did:example:member",
                 from,
                 Some(from - chrono::Duration::hours(1))
             ),

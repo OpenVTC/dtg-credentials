@@ -83,8 +83,8 @@ fn a_chain_rooted_elsewhere_establishes_nothing() {
 #[test]
 fn an_acceptance_completes_the_edge() {
     let grant = root_delegation();
-    let acceptance =
-        DTGCredential::new_delegate_vdc(&wire(&grant), t(0), t(24 * 90)).expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
+        .expect("accepts");
 
     // Mirrored parties: the delegate issues, the delegator is the subject.
     assert_eq!(acceptance.issuer(), AGENT);
@@ -99,8 +99,8 @@ fn an_acceptance_completes_the_edge() {
 #[test]
 fn an_acceptance_restates_no_scope() {
     let grant = root_delegation();
-    let acceptance =
-        DTGCredential::new_delegate_vdc(&wire(&grant), t(0), t(24 * 90)).expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
+        .expect("accepts");
 
     let d = acceptance.credential().delegation().unwrap();
     assert!(d.scope.is_none());
@@ -113,8 +113,8 @@ fn an_acceptance_restates_no_scope() {
 #[test]
 fn a_reissued_grant_is_no_longer_accepted_by_the_old_acceptance() {
     let grant = root_delegation();
-    let acceptance =
-        DTGCredential::new_delegate_vdc(&wire(&grant), t(0), t(24 * 90)).expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
+        .expect("accepts");
 
     // Same parties, wider appointment.
     let reissued = DTGCredential::new_vdc(
@@ -143,14 +143,63 @@ fn a_reissued_grant_is_no_longer_accepted_by_the_old_acceptance() {
 #[test]
 fn an_acceptance_cannot_itself_be_accepted() {
     let grant = root_delegation();
-    let acceptance =
-        DTGCredential::new_delegate_vdc(&wire(&grant), t(0), t(24 * 90)).expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
+        .expect("accepts");
 
-    let err = DTGCredential::new_delegate_vdc(&wire(&acceptance), t(0), t(24 * 90)).unwrap_err();
+    let err = DTGCredential::new_delegate_vdc_for(&wire(&acceptance), ALICE, t(0), t(24 * 90))
+        .unwrap_err();
     assert!(
         matches!(err, DTGCredentialError::NotADelegationGrant(_)),
         "got {err:?}"
     );
+}
+
+/// A delegate accepts a grant for itself. A grant appointing somebody else is refused before
+/// anything is built.
+#[test]
+fn a_grant_appointing_someone_else_is_refused() {
+    let grant = root_delegation(); // appoints AGENT
+
+    let err =
+        DTGCredential::new_delegate_vdc_for(&wire(&grant), MALLORY, t(0), t(24 * 90)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DTGCredentialError::NotTheGrantSubject { ref expected, ref found }
+                if expected == MALLORY && found == AGENT
+        ),
+        "got {err:?}"
+    );
+}
+
+/// An acceptance that outlives its grant records consent to an appointment that has already
+/// ended.
+#[test]
+fn an_acceptance_may_not_outlive_its_grant() {
+    let grant = root_delegation(); // valid until t(24 * 90)
+
+    let err =
+        DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 91)).unwrap_err();
+    assert!(
+        matches!(err, DTGCredentialError::OutlivesGrant { .. }),
+        "got {err:?}"
+    );
+
+    DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 30))
+        .expect("ending before the grant is within it");
+}
+
+/// Accepting is binding, not verification: an unsigned grant accepts perfectly well, and
+/// fails only when its proof is checked.
+#[cfg(feature = "affinidi-signing")]
+#[test]
+fn an_unsigned_grant_does_not_verify() {
+    let grant = wire(&root_delegation());
+
+    DTGCredential::new_delegate_vdc_for(&grant, AGENT, t(0), t(24 * 90)).expect("binds");
+
+    let err = dtg_credentials::verify_grant_with_public_key(&grant, &[0u8; 32], t(1)).unwrap_err();
+    assert!(matches!(err, DTGCredentialError::NotSigned), "got {err:?}");
 }
 
 /// A pair naming different parties is not an edge, however well the digest matches.
@@ -158,7 +207,8 @@ fn an_acceptance_cannot_itself_be_accepted() {
 fn an_acceptance_from_the_wrong_party_binds_nothing() {
     let grant = root_delegation();
     let mut acceptance =
-        DTGCredential::new_delegate_vdc(&wire(&grant), t(0), t(24 * 90)).expect("accepts");
+        DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
+            .expect("accepts");
     acceptance.credential_mut().issuer = MALLORY.into();
 
     assert!(!acceptance.accepts(&grant).unwrap());
@@ -168,8 +218,8 @@ fn an_acceptance_from_the_wrong_party_binds_nothing() {
 #[test]
 fn an_acceptance_in_a_chain_is_refused() {
     let grant = root_delegation();
-    let acceptance =
-        DTGCredential::new_delegate_vdc(&wire(&grant), t(0), t(24 * 90)).expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
+        .expect("accepts");
 
     let err = verify_chain(&[acceptance], ALICE, "schedule:read", AGENT, t(1)).unwrap_err();
     assert!(
@@ -499,7 +549,7 @@ fn an_inverted_window_is_refused_at_issue() {
     .unwrap_err();
     assert!(is_window_error(&err), "got {err:?}");
 
-    let err = DTGCredential::new_delegate_vdc(&wire(&root), t(24), t(0)).unwrap_err();
+    let err = DTGCredential::new_delegate_vdc_for(&wire(&root), AGENT, t(24), t(0)).unwrap_err();
     assert!(is_window_error(&err), "got {err:?}");
 }
 
@@ -638,8 +688,8 @@ fn a_vdc_round_trips_through_json() {
     assert!(d.parent.is_none(), "a root delegation carries no parent");
     assert!(d.accepts.is_none(), "a grant carries no accepts");
 
-    let acceptance =
-        DTGCredential::new_delegate_vdc(&wire(&root), t(0), t(24 * 90)).expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&root), AGENT, t(0), t(24 * 90))
+        .expect("accepts");
     let back: DTGCredential =
         serde_json::from_str(&serde_json::to_string(&acceptance).unwrap()).unwrap();
     assert!(

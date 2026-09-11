@@ -171,10 +171,15 @@ let grant = DTGCredential::new_vmc(
 ).with_id(format!("urn:uuid:{}", Uuid::new_v4()));
 grant.sign(&community_key, None).await?;
 
-// Member side: acknowledge it. `grant_json` is the JSON the community sent —
-// the wire form, not a parse of it. The parties are read off the grant, so the
-// two halves cannot disagree about who they are between.
-let mut ack = DTGCredential::new_member_vmc(&grant_json, Utc::now(), None)?
+// Member side: verify the grant before answering it. `grant_json` is the JSON the
+// community sent — the wire form, not a parse of it — and the key is resolved
+// from the community's DID document.
+verify_grant_with_public_key(&grant_json, &community_public_key, Utc::now())?;
+
+// Then acknowledge it, as yourself. The parties are read off the grant, so the
+// two halves cannot disagree about who they are between, and a grant naming
+// anyone but `member_did` is refused.
+let mut ack = DTGCredential::new_member_vmc_for(&grant_json, &member_did, Utc::now(), valid_until)?
   .with_id(format!("urn:uuid:{}", Uuid::new_v4()));
 ack.sign(&member_key, None).await?;
 
@@ -187,6 +192,19 @@ It deliberately does **not** check either credential's proof or validity window:
 proof verification needs a resolver this crate does not hold, and whether a
 window is current is a question about an instant the caller chooses. An edge is
 complete when both halves are valid *and* bound; this covers the binding.
+
+Building the acknowledgement checks the binding too, and does not ask who signed
+the grant. What `new_member_vmc_for()` does check is that the grant names the
+member you pass — so pass the identity whose key you hold, never one read out of
+the grant — and that the acknowledgement does not outlive the grant.
+`verify_grant_with_public_key()` (feature `affinidi-signing`) covers the rest
+before you answer: the proof, that the proof's verification method belongs to
+the grant's issuer, and that the grant is in force.
+
+> [!NOTE]
+> `new_member_vmc()` and `new_delegate_vdc()` are deprecated in favour of
+> `new_member_vmc_for()` and `new_delegate_vdc_for()`, which take the party you
+> expect the grant to name.
 
 Because the digest covers the grant's claims, a **re-issued** grant carries a
 different digest and the earlier acknowledgement no longer matches it. Renewal
@@ -276,8 +294,10 @@ let grant = DTGCredential::new_vdc(
   Some(1),                          // maxDepth; None or 0 prohibits re-delegation
 )?;
 
-// The agent accepts. `grant_json` is the wire form, not a parse of it.
-let acceptance = DTGCredential::new_delegate_vdc(&grant_json, now, valid_until)?;
+// The agent verifies the grant, then accepts it as itself. `grant_json` is the
+// wire form, not a parse of it.
+verify_grant_with_public_key(&grant_json, &alice_public_key, now)?;
+let acceptance = DTGCredential::new_delegate_vdc_for(&grant_json, &agent_did, now, valid_until)?;
 assert!(acceptance.accepts(&grant)?);
 ```
 
