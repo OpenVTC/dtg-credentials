@@ -143,6 +143,14 @@ pub enum DTGCredentialError {
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     },
+
+    /// A JSON document was nested more deeply than [`MAX_JSON_DEPTH`] allows.
+    ///
+    /// Digesting, signing and verifying all walk a credential recursively, so a value deep
+    /// enough exhausts the stack and aborts the process. It is refused before any of that
+    /// work starts.
+    #[error("JSON is nested more than {max} levels deep")]
+    JsonTooDeep { max: usize },
 }
 
 /// Defined DTG Credentials
@@ -247,7 +255,14 @@ impl DTGCredential {
     /// — but a member *inside* `credentialSubject` that the subject types do not model is
     /// still not represented. Where you still hold the bytes a counterparty sent, digest
     /// those with [`digest_multibase_json`].
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::JsonTooDeep] if an open JSON member takes the credential past
+    /// [`MAX_JSON_DEPTH`], checked before the credential is cloned or serialized.
     pub fn digest_multibase(&self) -> Result<String, DTGCredentialError> {
+        self.credential.check_depth()?;
+
         let unsigned = DTGCommon {
             proof: None,
             ..self.credential.clone()
@@ -266,6 +281,8 @@ impl DTGCredential {
                 release."
     )]
     pub fn digest(&self) -> Result<String, DTGCredentialError> {
+        self.credential.check_depth()?;
+
         let unsigned = DTGCommon {
             proof: None,
             ..self.credential.clone()
@@ -438,9 +455,13 @@ impl DTGCredential {
     ///
     /// - The validity window is well formed: `validUntil`, where present, is after
     ///   `validFrom` ([DTGCredentialError::InvalidValidityWindow]).
+    /// - No open JSON member — `endorsement`, `credentialStatus`, an unmodelled top-level
+    ///   member — takes the document past [`MAX_JSON_DEPTH`]
+    ///   ([DTGCredentialError::JsonTooDeep]). The check does not recurse.
     ///
     /// [DTGCredential::sign] calls this first, so this library never signs a credential
-    /// that fails it. The `new_*` constructors that return a plain `Self` have no way to
+    /// that fails it, and [DTGCredential::verify_proof_with_public_key] calls it before
+    /// examining a proof. The `new_*` constructors that return a plain `Self` have no way to
     /// refuse, so a credential built by one of them is checked here rather than there. If
     /// you sign with another backend, call this yourself before you do.
     ///
@@ -448,7 +469,8 @@ impl DTGCredential {
     /// credential with the date the original took effect is the usual case — so only the
     /// ordering of the two ends is checked, never either end against the clock.
     pub fn validate(&self) -> Result<(), DTGCredentialError> {
-        crate::create::check_window(self.valid_from(), self.valid_until())
+        crate::create::check_window(self.valid_from(), self.valid_until())?;
+        self.credential.check_depth()
     }
 
     #[cfg(feature = "affinidi-signing")]
@@ -481,10 +503,17 @@ impl DTGCredential {
     /// Verify the credential if you already know the public key bytes
     /// otherwise use the affinidi_tdk:verify_data() method
     /// public_key_bytes: The public key bytes to use to verify the credential
+    ///
+    /// # Errors
+    ///
+    /// Anything [DTGCredential::validate] refuses, before the proof is examined: a
+    /// credential this library would not have signed does not verify either.
     pub fn verify_proof_with_public_key(
         &self,
         public_key_bytes: &[u8],
     ) -> Result<(), DTGCredentialError> {
+        self.validate()?;
+
         let proof = if let Some(proof) = &self.credential.proof {
             proof.clone()
         } else {
@@ -524,6 +553,69 @@ impl DTGCredential {
 ///
 /// [multicodec]: https://www.w3.org/TR/cid-1.0/#multihash
 const MULTIHASH_SHA2_256: u64 = 0x12;
+
+/// The deepest JSON document this library will digest, sign or verify.
+///
+/// Depth counts from the top of the credential: the document itself is depth 1, and each
+/// value inside an object or array is one deeper than its container. A VEC's `endorsement`
+/// therefore sits at depth 3, and a top-level member such as `credentialStatus` at depth 2.
+///
+/// # Why there is a bound
+///
+/// Digesting, signing and verifying clone, serialize and canonicalize a credential, and each
+/// of those recurses once per level of nesting. A value nested a few thousand levels deep
+/// exhausts the stack, and a stack overflow aborts the process — it is not an error a caller
+/// can handle. The members this library holds as open JSON are where such a value gets in:
+/// a VEC's `endorsement`, `credentialStatus`, and the unmodelled members in
+/// [`DTGCommon::extra`].
+///
+/// # Why this value
+///
+/// `serde_json` already refuses to parse JSON nested 128 levels deep, so a credential that
+/// arrived over the wire is bounded before it gets here. 64 stays well under that — nothing
+/// this library signs is too deep for a stock verifier to parse back — and is still far more
+/// than any credential in the specification needs.
+///
+/// # What it cannot do
+///
+/// A `serde_json::Value` is dropped recursively as well. A caller already holding a value
+/// deep enough to overflow the stack will overflow it when that value goes out of scope,
+/// whatever this library returns. The parser is the real boundary: `serde_json` applies its
+/// limit by default, so leave it on.
+pub const MAX_JSON_DEPTH: usize = 64;
+
+/// Is any value reachable from `roots` deeper than [`MAX_JSON_DEPTH`]?
+///
+/// Each root is paired with the depth it sits at in the enclosing document. The walk keeps
+/// an explicit stack rather than recursing: its job is to refuse a value too deep to process
+/// safely, so it must not be what exhausts the call stack.
+fn exceeds_max_depth<'a>(roots: impl IntoIterator<Item = (&'a Value, usize)>) -> bool {
+    let mut pending: Vec<(&Value, usize)> = roots.into_iter().collect();
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_JSON_DEPTH {
+            return true;
+        }
+        match value {
+            Value::Array(items) => pending.extend(items.iter().map(|item| (item, depth + 1))),
+            Value::Object(members) => {
+                pending.extend(members.values().map(|member| (member, depth + 1)))
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Refuses a JSON document nested more deeply than [`MAX_JSON_DEPTH`].
+pub(crate) fn check_json_depth(doc: &Value) -> Result<(), DTGCredentialError> {
+    if exceeds_max_depth([(doc, 1)]) {
+        Err(DTGCredentialError::JsonTooDeep {
+            max: MAX_JSON_DEPTH,
+        })
+    } else {
+        Ok(())
+    }
+}
 
 /// Strips a credential's top-level `proof` member, if it has one.
 fn proofless(doc: &Value) -> Value {
@@ -569,7 +661,14 @@ fn proofless(doc: &Value) -> Value {
 /// reference survives its referent being re-signed. A re-issued credential carries
 /// different claims and therefore a different digest, which is what makes renewal force
 /// re-acknowledgement.
+///
+/// # Errors
+///
+/// [DTGCredentialError::JsonTooDeep] if `doc` is nested more deeply than
+/// [`MAX_JSON_DEPTH`], checked before anything clones or canonicalizes it.
 pub fn digest_multibase_json(doc: &Value) -> Result<String, DTGCredentialError> {
+    check_json_depth(doc)?;
+
     let canonical = serde_json_canonicalizer::to_vec(&proofless(doc))
         .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
 
@@ -646,6 +745,8 @@ pub fn digests_match(left: &str, right: &str) -> Result<bool, DTGCredentialError
             digest_multibase_json. This function will be removed in a future release."
 )]
 pub fn digest_json(doc: &Value) -> Result<String, DTGCredentialError> {
+    check_json_depth(doc)?;
+
     let canonical = serde_json_canonicalizer::to_vec(&proofless(doc))
         .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
 
@@ -960,6 +1061,35 @@ impl DTGCommon {
     /// The `threadId` of the trust task exchange this credential was issued in, if set
     pub fn task_context(&self) -> Option<&str> {
         self.task_context.as_deref()
+    }
+
+    /// Refuses a credential whose open JSON members take the document past
+    /// [`MAX_JSON_DEPTH`].
+    ///
+    /// Every other member is a type this library defines, none more than four levels deep,
+    /// so the open members are the only place the bound can be crossed.
+    #[allow(deprecated)]
+    fn check_depth(&self) -> Result<(), DTGCredentialError> {
+        // The document is depth 1, so a top-level member sits at 2 and a member of
+        // `credentialSubject` at 3.
+        let mut roots: Vec<(&Value, usize)> =
+            self.extra.values().map(|member| (member, 2)).collect();
+        if let Some(status) = &self.credential_status {
+            roots.push((status, 2));
+        }
+        match &self.credential_subject {
+            CredentialSubject::Endorsement(subject) => roots.push((&subject.endorsement, 3)),
+            CredentialSubject::RCard(subject) => roots.push((&subject.card, 3)),
+            _ => {}
+        }
+
+        if exceeds_max_depth(roots) {
+            Err(DTGCredentialError::JsonTooDeep {
+                max: MAX_JSON_DEPTH,
+            })
+        } else {
+            Ok(())
+        }
     }
 }
 

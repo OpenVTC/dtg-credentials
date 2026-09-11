@@ -407,6 +407,9 @@ impl DTGCredential {
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        // Before any member is read out: reading clones one, and cloning recurses.
+        crate::check_json_depth(parent)?;
+
         let object = parent
             .as_object()
             .ok_or(DTGCredentialError::NotAnAuthorityCredential)?;
@@ -892,6 +895,9 @@ impl DTGCredential {
     fn read_delegation_json(
         doc: &Value,
     ) -> Result<(String, DelegationGrant, Option<DateTime<Utc>>), DTGCredentialError> {
+        // Before any member is read out: reading clones one, and cloning recurses.
+        crate::check_json_depth(doc)?;
+
         let object = doc
             .as_object()
             .ok_or_else(|| DTGCredentialError::MalformedDelegation("not a JSON object".into()))?;
@@ -981,6 +987,18 @@ impl DTGCredential {
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
     /// endorsement: The endorsement details for this credential
+    ///
+    /// # Security
+    ///
+    /// `endorsement` is embedded verbatim. The specification does not define its content,
+    /// so its shape is the issuer's to choose and this library checks nothing about it but
+    /// its depth. A VEC says only that its issuer said this: a consumer must verify the
+    /// proof, *and* establish that the issuer is one whose endorsements it accepts for this
+    /// purpose, before relying on any member of it.
+    ///
+    /// Build it from input you control. Nesting past [crate::MAX_JSON_DEPTH] is refused
+    /// when the credential is validated, digested or signed rather than here, because this
+    /// constructor cannot return an error.
     pub fn new_vec(
         issuer: String,
         subject: String,
@@ -1192,6 +1210,14 @@ impl DTGCredential {
     /// Neither [`crate::delegation::verify_chain`] nor [`crate::authority::verify_chain`]
     /// resolves a status entry; both verify structure, scope and validity only. Revocation
     /// is a live lookup the caller performs.
+    ///
+    /// # Security
+    ///
+    /// The entry is embedded verbatim and nothing about it is checked when it is attached.
+    /// It tells a verifier where to look, so a verifier must check the credential's proof
+    /// before following it, and should apply its own policy to where it leads. Nesting past
+    /// [crate::MAX_JSON_DEPTH] is refused when the credential is validated, digested or
+    /// signed, because this setter cannot return an error.
     pub fn with_credential_status(mut self, status: Value) -> Self {
         self.credential.credential_status = Some(status);
         self
@@ -1200,7 +1226,7 @@ impl DTGCredential {
     /// Attaches a revocation status mechanism in place.
     ///
     /// The non-consuming form of [DTGCredential::with_credential_status]; the same "before
-    /// signing" caveat and the same CONDITIONAL rule apply.
+    /// signing" caveat, the same CONDITIONAL rule and the same security notes apply.
     pub fn set_credential_status(&mut self, status: Value) {
         self.credential.credential_status = Some(status);
     }
