@@ -382,6 +382,7 @@ worth stating for each breaking release:
 | 0.7.0 | `parent` became a `digestMultibase`; `digest` → `digestMultibase` | Verifiers first |
 | 0.8.0 | `authority::verify_chain` requires the leaf to grant to `presenter`; `audience` removed | Verifiers first |
 | 0.9.1 | `delegation::verify_chain` requires the leaf to appoint `presenter` | Verifiers first |
+| 0.10.0 | Validity-window and JSON-depth checks at issue and verify; `DTGCredentialError` is `#[non_exhaustive]` | Verifiers first |
 
 Every one of them is *verifiers first*, and for the same reason: each made a verifier
 stricter or changed what it reads, so a verifier that moves first accepts everything
@@ -390,6 +391,15 @@ it did before and is ready for what issuers send next.
 `0.8.0` and `0.9.1` are API breaks rather than wire changes — no credential changes
 shape — but they land in the same place: a caller that upgrades gets a compile error
 naming the new parameter, which is the intended way to find out.
+
+`0.10.0` breaks the API in a smaller way: `DTGCredentialError` becomes
+`#[non_exhaustive]`, so an exhaustive `match` on it needs a wildcard arm. It also refuses
+more, on both sides. Every constructor that returns a `Result`, and `sign()`, refuse a
+validity window that closes before it opens and JSON nested past `MAX_JSON_DEPTH`;
+`verify_proof_with_public_key()` refuses the same before it looks at a proof. A conforming
+issuer emits neither, so verifiers-first still holds. `new_member_vmc()` and
+`new_delegate_vdc()` are deprecated rather than removed: they still compile, and a build
+with `-D warnings` names the `_for` replacement.
 
 ## End to End Example
 

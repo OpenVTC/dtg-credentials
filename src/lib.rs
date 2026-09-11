@@ -44,7 +44,10 @@ impl TryFrom<&[String]> for W3CVCVersion {
 }
 
 /// Errors related to DTG Credentials
+///
+/// New variants may be added in minor releases; match with a wildcard arm.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum DTGCredentialError {
     #[error("Unknown credential type")]
     UnknownCredential,

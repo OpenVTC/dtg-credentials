@@ -245,7 +245,7 @@ impl DTGCredential {
     /// the grant with nothing to compare it against, and the grant's `validUntil` is not
     /// consulted.
     #[deprecated(
-        since = "0.9.2",
+        since = "0.10.0",
         note = "Takes the member from the grant without comparing it to anything, and lets \
                 the acknowledgement outlive the grant. Use DTGCredential::new_member_vmc_for, \
                 which takes the member you expect and refuses a grant naming anyone else. \
@@ -972,7 +972,7 @@ impl DTGCredential {
     /// from the grant with nothing to compare it against, and the grant's `validUntil` is not
     /// consulted.
     #[deprecated(
-        since = "0.9.2",
+        since = "0.10.0",
         note = "Takes the delegate from the grant without comparing it to anything, and lets \
                 the acceptance outlive the grant. Use DTGCredential::new_delegate_vdc_for, \
                 which takes the delegate you expect and refuses a grant appointing anyone \
