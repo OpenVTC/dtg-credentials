@@ -1,0 +1,27 @@
+# Keeps the SHA-pinned actions in .github/workflows current, and the crate's
+# dependencies with them. Dependabot rewrites a pinned SHA and the version
+# comment beside it together.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # A release gets a week to be noticed - retagged, withdrawn, reported - before
+    # it is proposed here. Security updates are not held back by this.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
