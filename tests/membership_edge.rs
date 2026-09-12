@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 const COMMUNITY: &str = "did:example:community";
 const MEMBER: &str = "did:example:member";
 const SOMEONE_ELSE: &str = "did:example:someone-else";
+const ATTACKER: &str = "did:example:attacker";
 
 fn t(h: i64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 6, 10, 0, 0).unwrap() + Duration::hours(h)
@@ -33,6 +34,22 @@ fn unsigned_grant(community: &str, member: &str, valid_until: Option<DateTime<Ut
         false,
     ))
     .unwrap()
+}
+
+/// A grant nobody issued: hand-written by `member`, naming `community` as its issuer and
+/// carrying no proof, because the community it names never signed anything. Written out
+/// rather than built, since an attacker has no reason to use this library's constructors.
+fn forged_grant(community: &str, member: &str) -> Value {
+    json!({
+        "@context": [
+            "https://www.w3.org/ns/credentials/v2",
+            "https://firstperson.network/credentials/dtg/v1"
+        ],
+        "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
+        "issuer": community,
+        "validFrom": "2026-01-06T10:00:00Z",
+        "credentialSubject": { "id": member }
+    })
 }
 
 /// The ordinary case, and the roles it produces: the member issues, the community is the
@@ -165,6 +182,33 @@ fn binding_does_not_establish_that_the_grant_was_signed() {
     assert!(
         ack.acknowledges(&grant).unwrap(),
         "the binding holds whether or not anybody signed the grant"
+    );
+}
+
+/// Naming yourself is the one grant the member check cannot refuse: it compares the grant
+/// with the identity the caller expects, and an attacker writing its own grant satisfies
+/// both sides of that comparison. So the constructor builds, and the binding holds — which
+/// is the whole of what building an acknowledgement claims. The step that refuses this
+/// grant is verifying it: a grant its own subject wrote carries no proof from the community
+/// it names, which `verifying_the_grant::an_unsigned_grant_does_not_verify` pins.
+#[test]
+fn a_grant_its_own_subject_wrote_satisfies_the_member_check() {
+    let forged = forged_grant(COMMUNITY, ATTACKER);
+
+    let ack = DTGCredential::new_member_vmc_for(&forged, ATTACKER, t(1), None)
+        .expect("the expected member and the grant's subject are the same identifier");
+    assert_eq!(ack.issuer(), ATTACKER);
+    assert_eq!(ack.subject(), COMMUNITY);
+    assert_eq!(
+        ack.subject_digest(),
+        Some(digest_multibase_json(&forged).unwrap().as_str())
+    );
+
+    let forged: DTGCredential = serde_json::from_value(forged).unwrap();
+    assert!(!forged.signed(), "the community it names never signed it");
+    assert!(
+        ack.acknowledges(&forged).unwrap(),
+        "the binding holds; it is a binding to a document, not to a membership"
     );
 }
 

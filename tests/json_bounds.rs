@@ -223,6 +223,52 @@ fn deriving_from_a_deep_parent_is_refused_without_exhausting_the_stack() {
     drop((vac, vdc));
 }
 
+/// Answering a grant digests the document the counterparty sent, in the wire form it
+/// arrived in. The `_for` constructors reach that digest only after the member and the
+/// grant's expiry have been read, so the bound has to hold at the end of that sequence as
+/// well as at the start of a derivation.
+#[test]
+fn answering_a_deep_grant_is_refused_without_exhausting_the_stack() {
+    let until = t0() + Duration::days(30);
+
+    let mut membership = serde_json::to_value(DTGCredential::new_vmc(
+        ISSUER.into(),
+        SUBJECT.into(),
+        t0(),
+        Some(until),
+        false,
+    ))
+    .unwrap();
+    membership["evidence"] = deep(OVER_DEEP);
+
+    let mut delegation = serde_json::to_value(
+        DTGCredential::new_vdc(
+            ISSUER.into(),
+            SUBJECT.into(),
+            t0(),
+            until,
+            vec!["sign:invoices".into()],
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    delegation["evidence"] = deep(OVER_DEEP);
+
+    // The subject of each grant answers its own grant, so the member check passes and the
+    // digest is reached.
+    let (acknowledged, accepted, membership, delegation) = on_a_small_stack(move || {
+        let acknowledged =
+            DTGCredential::new_member_vmc_for(&membership, SUBJECT, t0(), Some(until));
+        let accepted = DTGCredential::new_delegate_vdc_for(&delegation, SUBJECT, t0(), until);
+        (acknowledged, accepted, membership, delegation)
+    });
+
+    assert!(is_too_deep(&acknowledged), "got {acknowledged:?}");
+    assert!(is_too_deep(&accepted), "got {accepted:?}");
+    drop((membership, delegation));
+}
+
 /// serde_json refuses to parse JSON nested 128 levels deep by default, which is what bounds
 /// a credential arriving over the wire before it reaches this library. Pinned, because
 /// [`MAX_JSON_DEPTH`] is chosen relative to it.
@@ -276,6 +322,7 @@ fn open_members_are_carried_verbatim_within_the_bound() {
 mod signing {
     use super::*;
     use affinidi_secrets_resolver::secrets::Secret;
+    use dtg_credentials::verify_grant_with_public_key;
 
     #[tokio::test]
     async fn sign_refuses_a_deep_endorsement() {
@@ -284,6 +331,30 @@ mod signing {
 
         assert!(is_too_deep(&vec.sign(&secret, None).await));
         assert!(!vec.signed(), "a refused credential must not carry a proof");
+    }
+
+    /// Verifying a grant is the one entry point handed a whole document by a counterparty
+    /// before anything about it is established, so it is the one most worth running on a
+    /// stack too small to walk a hostile value.
+    ///
+    /// The grant is signed before the deep member is attached. Without the bound, the
+    /// verifier gets as far as cloning the document to strip `proof` from it, and that clone
+    /// recurses; an unsigned grant would be refused before reaching it and prove nothing.
+    #[tokio::test]
+    async fn verifying_a_deep_grant_is_refused_without_exhausting_the_stack() {
+        let secret = Secret::generate_ed25519(Some(&format!("{ISSUER}#key-1")), None);
+        let mut grant = DTGCredential::new_vmc(ISSUER.into(), SUBJECT.into(), t0(), None, false);
+        grant.sign(&secret, None).await.expect("signs");
+
+        let mut grant = serde_json::to_value(&grant).unwrap();
+        grant["credentialStatus"] = deep(OVER_DEEP);
+        let key = secret.get_public_bytes().to_vec();
+
+        let (verified, grant) =
+            on_a_small_stack(move || (verify_grant_with_public_key(&grant, &key, t0()), grant));
+
+        assert!(is_too_deep(&verified), "got {verified:?}");
+        drop(grant);
     }
 
     /// A signed credential given a deep member afterwards is refused before its proof is
