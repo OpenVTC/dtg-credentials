@@ -189,8 +189,8 @@ fn binding_does_not_establish_that_the_grant_was_signed() {
 /// with the identity the caller expects, and an attacker writing its own grant satisfies
 /// both sides of that comparison. So the constructor builds, and the binding holds — which
 /// is the whole of what building an acknowledgement claims. The step that refuses this
-/// grant is verifying it, pinned in
-/// `verifying_the_grant::a_grant_its_own_subject_wrote_does_not_verify`.
+/// grant is verifying it: a grant its own subject wrote carries no proof from the community
+/// it names, which `verifying_the_grant::an_unsigned_grant_does_not_verify` pins.
 #[test]
 fn a_grant_its_own_subject_wrote_satisfies_the_member_check() {
     let forged = forged_grant(COMMUNITY, ATTACKER);
@@ -259,22 +259,6 @@ mod verifying_the_grant {
         let grant = unsigned_grant(COMMUNITY, MEMBER, None);
 
         let err = verify_grant_with_public_key(&grant, key.get_public_bytes(), t(1)).unwrap_err();
-        assert!(matches!(err, DTGCredentialError::NotSigned), "got {err:?}");
-    }
-
-    /// A grant its own subject wrote carries no proof from the community it names, so it
-    /// does not verify under that community's key. A member that verifies before answering
-    /// never reaches the constructor with it.
-    #[test]
-    fn a_grant_its_own_subject_wrote_does_not_verify() {
-        let key = key_of(COMMUNITY);
-
-        let err = verify_grant_with_public_key(
-            &forged_grant(COMMUNITY, ATTACKER),
-            key.get_public_bytes(),
-            t(1),
-        )
-        .unwrap_err();
         assert!(matches!(err, DTGCredentialError::NotSigned), "got {err:?}");
     }
 

@@ -336,6 +336,10 @@ mod signing {
     /// Verifying a grant is the one entry point handed a whole document by a counterparty
     /// before anything about it is established, so it is the one most worth running on a
     /// stack too small to walk a hostile value.
+    ///
+    /// The grant is signed before the deep member is attached. Without the bound, the
+    /// verifier gets as far as cloning the document to strip `proof` from it, and that clone
+    /// recurses; an unsigned grant would be refused before reaching it and prove nothing.
     #[tokio::test]
     async fn verifying_a_deep_grant_is_refused_without_exhausting_the_stack() {
         let secret = Secret::generate_ed25519(Some(&format!("{ISSUER}#key-1")), None);
