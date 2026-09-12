@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-11
+
+**Issue-time validation, and a way to answer a grant only on your own behalf.** No function
+signatures change, and nothing changes on the wire for a well-formed credential. Several
+calls now refuse input they used to accept; each is listed below.
+
+> [!IMPORTANT]
+> **API break:** `DTGCredentialError` is now `#[non_exhaustive]` and gains seven variants.
+> A consumer matching on it exhaustively needs a wildcard arm. Future error variants are
+> not breaking changes.
+>
+> `new_member_vmc` and `new_delegate_vdc` are **deprecated**, not removed. They compile and
+> behave as before, but a build with `-D warnings` fails until it moves to the `_for` forms.
+> Together these are why this is 0.10.0 rather than 0.9.2: a `cargo update` on
+> `dtg-credentials = "0.9"` does not pick it up, so no consumer's build changes without a
+> deliberate bump.
+
+### Added — answering a grant takes the party you expect it to name
+
+`DTGCredential::new_member_vmc_for(grant, member, valid_from, valid_until)` and
+`DTGCredential::new_delegate_vdc_for(grant, delegate, valid_from, valid_until)` build the
+member's acknowledgement and the delegate's acceptance exactly as the constructors they
+replace do, reading both parties off the grant — and then compare the grant's
+`credentialSubject.id` with the party the caller passed, refusing a mismatch with the new
+`DTGCredentialError::NotTheGrantSubject { expected, found }`.
+
+The old constructors took the party from the grant and had nothing to compare it against.
+The digest binds the answer to the grant, so what they produced was binding evidence, but
+nothing in their signatures obliged a caller to confirm that the grant named whoever was
+answering it. That is the shape `verify_chain` was in before 0.8.0 and 0.9.1 put the
+presenter in its signature, and the remedy is the same: the obligation is now a parameter.
+Pass the identity whose key will sign the answer, established independently of the grant.
+
+### Added — an answer may not outlive its grant
+
+Both `_for` constructors read the grant's `validUntil` and refuse, with
+`DTGCredentialError::OutlivesGrant`, an answer whose `validUntil` is later than the grant's —
+or absent, against a grant that expires. An acknowledgement dated past its grant records
+consent to a membership that has already ended. A grant `validUntil` that is not an RFC 3339
+timestamp is refused as a malformed grant rather than read as no expiry.
+
+### Added — `verify_grant_with_public_key`
+
+Behind `affinidi-signing`. Verifies a grant **in its wire form**, before it is answered:
+
+1. it carries a `proof` (`NotSigned` otherwise);
+2. the proof verifies under the given key, over the document without its `proof`;
+3. the proof's `verificationMethod` belongs to the grant's `issuer` — the DID before the `#`
+   fragment is exactly the issuer (`ProofNotFromIssuer`);
+4. the validity window is well formed and contains the given instant (`NotValidAt`).
+
+A grant with no `issuer` or `validFrom`, or with a timestamp or proof that cannot be read, is
+`MalformedCredential`. Resolve the key from the issuer's DID document: a key taken from the
+grant, or from whoever sent it, establishes nothing about the issuer.
+
+`acknowledges`, `accepts` and the new constructors gain a **Security** section. A binding is
+evidence; an edge is complete only when both proofs and both windows have verified.
+
+### Changed — a validity window must open before it closes
+
+Every constructor that returns a `Result` — `new_vac`, `new_vdc`, `attenuate`,
+`attenuate_from_json`, `redelegate`, `redelegate_from_json`, and the acknowledgement and
+acceptance constructors — now refuses a `validUntil` at or before `validFrom`, with the new
+`DTGCredentialError::InvalidValidityWindow`. Before, each returned a credential that is never
+valid. A chain built from one was caught by `verify_chain`; a standalone credential was
+caught nowhere, and `sign` put a proof on it.
+
+The constructors that return `Self` cannot refuse, so the new `DTGCredential::validate`
+checks their output, and `sign` calls it before signing. Call it yourself if you sign with
+another backend. Both ends are compared at whole seconds, which is all the wire form carries.
+A `validFrom` in the past is still accepted: backdating is how a re-issued credential keeps
+the date the original took effect.
+
+### Changed — open JSON is bounded in depth
+
+A VEC's `endorsement`, `credentialStatus`, and the unmodelled top-level members in
+`DTGCommon::extra` are open `serde_json::Value`s, and digesting, signing and verifying walk
+them recursively. A value nested a few thousand levels deep overflowed the stack and aborted
+the process instead of returning an error.
+
+The new `MAX_JSON_DEPTH` (64, counted from the top of the credential) bounds them, reported
+as the new `DTGCredentialError::JsonTooDeep`. The check does not recurse, and runs ahead of
+everything that does: in `digest_multibase_json` and `digest_json`, in `attenuate_from_json`
+and `redelegate_from_json`, in `digest_multibase` and `digest`, and in `validate` — which
+`sign` calls, and which `verify_proof_with_public_key` now calls too, so a credential this
+library would refuse to sign does not verify either.
+
+64 is well inside serde_json's default parser limit of 128, so anything signed here parses
+back in a stock verifier, and a credential received over the wire is bounded by that parser
+before it arrives. The bound cannot help a caller that builds a deeper `Value` itself,
+because dropping one recurses too.
+
+`new_vec` and `with_credential_status` gain a **Security** section: both embed their input
+verbatim, and a consumer must verify the proof and the issuer's standing before relying on
+any of it.
+
 ## [0.9.1] - 2026-09-09
 
 Closes the two findings in #22 and #23.

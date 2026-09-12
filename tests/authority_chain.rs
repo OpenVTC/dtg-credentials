@@ -9,7 +9,7 @@
 
 use chrono::{Duration, TimeZone, Utc};
 use dtg_credentials::authority::{AuthorityError, MAX_CHAIN_DEPTH, verify_chain};
-use dtg_credentials::{DTGCredential, DTGCredentialType};
+use dtg_credentials::{DTGCredential, DTGCredentialError, DTGCredentialType};
 
 const ROOM: &str = "did:webvh:zroom:example.com:rooms:7f3a";
 const BOB: &str = "did:key:zBob";
@@ -41,6 +41,97 @@ fn agent_grant(parent: &DTGCredential) -> DTGCredential {
         .attenuate(AGENT.into(), vec!["read".into()], t(0), t(4))
         .expect("attenuation")
         .with_id("urn:uuid:agent-0001")
+}
+
+/// A window that closes before it opens describes a VAC that is never valid. It is refused
+/// where it is built, rather than left for each verifier to notice.
+#[test]
+fn an_inverted_window_is_refused_at_issue() {
+    let inverted = DTGCredential::new_vac(
+        ROOM.into(),
+        BOB.into(),
+        ROOM.into(),
+        vec!["read".into()],
+        t(24),
+        t(0),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(inverted, DTGCredentialError::InvalidValidityWindow { .. }),
+        "got {inverted:?}"
+    );
+
+    // An empty window is no better: `validUntil` must be strictly after `validFrom`.
+    let empty = DTGCredential::new_vac(
+        ROOM.into(),
+        BOB.into(),
+        ROOM.into(),
+        vec!["read".into()],
+        t(0),
+        t(0),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(empty, DTGCredentialError::InvalidValidityWindow { .. }),
+        "got {empty:?}"
+    );
+
+    // Nor may attenuation produce one, even inside the parent's window.
+    let root = root_grant();
+    let err = root
+        .attenuate(AGENT.into(), vec!["read".into()], t(4), t(2))
+        .unwrap_err();
+    assert!(
+        matches!(err, DTGCredentialError::InvalidValidityWindow { .. }),
+        "got {err:?}"
+    );
+
+    let err = DTGCredential::attenuate_from_json(
+        &serde_json::to_value(&root).unwrap(),
+        AGENT.into(),
+        vec!["read".into()],
+        t(4),
+        t(4),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, DTGCredentialError::InvalidValidityWindow { .. }),
+        "got {err:?}"
+    );
+}
+
+/// Backdating is legitimate — a re-issued credential keeps the date the original took
+/// effect — so only the ordering of the two ends is checked, never either against the clock.
+#[test]
+fn a_backdated_window_is_accepted_at_issue() {
+    DTGCredential::new_vac(
+        ROOM.into(),
+        BOB.into(),
+        ROOM.into(),
+        vec!["read".into()],
+        t(-24 * 365 * 5),
+        t(1),
+    )
+    .expect("a window that opened years ago is well formed");
+}
+
+/// The wire form carries whole seconds, so a window narrower than one serializes as an
+/// empty window and is refused as one.
+#[test]
+fn a_window_narrower_than_a_second_is_refused() {
+    let err = DTGCredential::new_vac(
+        ROOM.into(),
+        BOB.into(),
+        ROOM.into(),
+        vec!["read".into()],
+        t(0) + Duration::milliseconds(100),
+        t(0) + Duration::milliseconds(900),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, DTGCredentialError::InvalidValidityWindow { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]

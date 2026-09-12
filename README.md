@@ -171,10 +171,15 @@ let grant = DTGCredential::new_vmc(
 ).with_id(format!("urn:uuid:{}", Uuid::new_v4()));
 grant.sign(&community_key, None).await?;
 
-// Member side: acknowledge it. `grant_json` is the JSON the community sent —
-// the wire form, not a parse of it. The parties are read off the grant, so the
-// two halves cannot disagree about who they are between.
-let mut ack = DTGCredential::new_member_vmc(&grant_json, Utc::now(), None)?
+// Member side: verify the grant before answering it. `grant_json` is the JSON the
+// community sent — the wire form, not a parse of it — and the key is resolved
+// from the community's DID document.
+verify_grant_with_public_key(&grant_json, &community_public_key, Utc::now())?;
+
+// Then acknowledge it, as yourself. The parties are read off the grant, so the
+// two halves cannot disagree about who they are between, and a grant naming
+// anyone but `member_did` is refused.
+let mut ack = DTGCredential::new_member_vmc_for(&grant_json, &member_did, Utc::now(), valid_until)?
   .with_id(format!("urn:uuid:{}", Uuid::new_v4()));
 ack.sign(&member_key, None).await?;
 
@@ -187,6 +192,19 @@ It deliberately does **not** check either credential's proof or validity window:
 proof verification needs a resolver this crate does not hold, and whether a
 window is current is a question about an instant the caller chooses. An edge is
 complete when both halves are valid *and* bound; this covers the binding.
+
+Building the acknowledgement checks the binding too, and does not ask who signed
+the grant. What `new_member_vmc_for()` does check is that the grant names the
+member you pass — so pass the identity whose key you hold, never one read out of
+the grant — and that the acknowledgement does not outlive the grant.
+`verify_grant_with_public_key()` (feature `affinidi-signing`) covers the rest
+before you answer: the proof, that the proof's verification method belongs to
+the grant's issuer, and that the grant is in force.
+
+> [!NOTE]
+> `new_member_vmc()` and `new_delegate_vdc()` are deprecated in favour of
+> `new_member_vmc_for()` and `new_delegate_vdc_for()`, which take the party you
+> expect the grant to name.
 
 Because the digest covers the grant's claims, a **re-issued** grant carries a
 different digest and the earlier acknowledgement no longer matches it. Renewal
@@ -276,8 +294,10 @@ let grant = DTGCredential::new_vdc(
   Some(1),                          // maxDepth; None or 0 prohibits re-delegation
 )?;
 
-// The agent accepts. `grant_json` is the wire form, not a parse of it.
-let acceptance = DTGCredential::new_delegate_vdc(&grant_json, now, valid_until)?;
+// The agent verifies the grant, then accepts it as itself. `grant_json` is the
+// wire form, not a parse of it.
+verify_grant_with_public_key(&grant_json, &alice_public_key, now)?;
+let acceptance = DTGCredential::new_delegate_vdc_for(&grant_json, &agent_did, now, valid_until)?;
 assert!(acceptance.accepts(&grant)?);
 ```
 
@@ -362,6 +382,7 @@ worth stating for each breaking release:
 | 0.7.0 | `parent` became a `digestMultibase`; `digest` → `digestMultibase` | Verifiers first |
 | 0.8.0 | `authority::verify_chain` requires the leaf to grant to `presenter`; `audience` removed | Verifiers first |
 | 0.9.1 | `delegation::verify_chain` requires the leaf to appoint `presenter` | Verifiers first |
+| 0.10.0 | Validity-window and JSON-depth checks at issue and verify; `DTGCredentialError` is `#[non_exhaustive]` | Verifiers first |
 
 Every one of them is *verifiers first*, and for the same reason: each made a verifier
 stricter or changed what it reads, so a verifier that moves first accepts everything
@@ -370,6 +391,15 @@ it did before and is ready for what issuers send next.
 `0.8.0` and `0.9.1` are API breaks rather than wire changes — no credential changes
 shape — but they land in the same place: a caller that upgrades gets a compile error
 naming the new parameter, which is the intended way to find out.
+
+`0.10.0` breaks the API in a smaller way: `DTGCredentialError` becomes
+`#[non_exhaustive]`, so an exhaustive `match` on it needs a wildcard arm. It also refuses
+more, on both sides. Every constructor that returns a `Result`, and `sign()`, refuse a
+validity window that closes before it opens and JSON nested past `MAX_JSON_DEPTH`;
+`verify_proof_with_public_key()` refuses the same before it looks at a proof. A conforming
+issuer emits neither, so verifiers-first still holds. `new_member_vmc()` and
+`new_delegate_vdc()` are deprecated rather than removed: they still compile, and a build
+with `-D warnings` names the `_for` replacement.
 
 ## End to End Example
 

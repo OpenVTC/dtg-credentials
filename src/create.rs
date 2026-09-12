@@ -9,15 +9,98 @@ use crate::{
     CredentialSubjectRCard, CredentialSubjectWitness, DTGCommon, DTGCredential, DTGCredentialError,
     DTGCredentialType, DelegationGrant, WitnessContext,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use serde_json::Value;
+
+/// Refuses a validity window that closes before, or at the instant, it opens.
+///
+/// Only the ordering is checked. A `valid_from` in the past is legitimate — backdating is
+/// how a re-issued credential keeps the date the original took effect — and whether a
+/// window is current is a question about an instant the verifier chooses.
+///
+/// Both ends are compared at whole seconds, because that is all the wire form carries: a
+/// window a few hundred milliseconds wide in memory serializes as an empty one.
+pub(crate) fn check_window(
+    valid_from: DateTime<Utc>,
+    valid_until: Option<DateTime<Utc>>,
+) -> Result<(), DTGCredentialError> {
+    match valid_until {
+        Some(valid_until) if valid_until.trunc_subsecs(0) <= valid_from.trunc_subsecs(0) => {
+            Err(DTGCredentialError::InvalidValidityWindow {
+                valid_from,
+                valid_until,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The issuer of a credential in its wire form: a string, or an object carrying an `id`, per
+/// the W3C data model.
+pub(crate) fn issuer_of(credential: &serde_json::Map<String, Value>) -> Option<String> {
+    credential.get("issuer").and_then(|issuer| {
+        issuer
+            .as_str()
+            .or_else(|| issuer.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+    })
+}
+
+/// Reads an RFC 3339 timestamp off a credential in its wire form, under its W3C VC 2.0 name
+/// or its 1.1 alias.
+///
+/// `Ok(None)` when neither is present. A value that is present but unreadable is an error
+/// rather than an absence: an expiry that cannot be read must not be treated as no expiry.
+pub(crate) fn read_timestamp(
+    credential: &serde_json::Map<String, Value>,
+    name: &str,
+    alias: &str,
+) -> Result<Option<DateTime<Utc>>, String> {
+    let Some(value) = credential.get(name).or_else(|| credential.get(alias)) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| Some(t.with_timezone(&Utc)))
+        .ok_or_else(|| format!("`{name}` is not an RFC 3339 timestamp"))
+}
+
+/// The `validUntil` of a grant in its wire form, if it has one.
+fn grant_valid_until(grant: &Value) -> Result<Option<DateTime<Utc>>, String> {
+    match grant.as_object() {
+        Some(object) => read_timestamp(object, "validUntil", "expirationDate"),
+        None => Ok(None),
+    }
+}
+
+/// Refuses an answer to a grant — an acknowledgement or an acceptance — that would remain
+/// valid after the grant it answers has expired.
+///
+/// Open-ended counts as outliving a grant that expires. Compared at whole seconds, the
+/// precision the wire form carries.
+fn check_within_grant(
+    valid_until: Option<DateTime<Utc>>,
+    grant_valid_until: Option<DateTime<Utc>>,
+) -> Result<(), DTGCredentialError> {
+    let Some(grant_valid_until) = grant_valid_until else {
+        return Ok(());
+    };
+    match valid_until {
+        Some(until) if until.trunc_subsecs(0) <= grant_valid_until.trunc_subsecs(0) => Ok(()),
+        _ => Err(DTGCredentialError::OutlivesGrant {
+            valid_until,
+            grant_valid_until,
+        }),
+    }
+}
 
 impl DTGCredential {
     /// Creates a new community-issued Verifiable Membership Credential (VMC) — the
     /// membership **grant**, the community → member half of a membership edge.
     ///
     /// A membership edge is a *pair* of VMCs, and this is only one of them. The member
-    /// answers with [DTGCredential::new_member_vmc], and the edge is not complete until
+    /// answers with [DTGCredential::new_member_vmc_for], and the edge is not complete until
     /// they have: a community can always issue a credential naming somebody as a member,
     /// but it cannot produce the acknowledgement without that party's signature. The pair
     /// is what makes an unconsented membership claim unprovable.
@@ -91,8 +174,11 @@ impl DTGCredential {
     ///
     /// So: keep the bytes you were given, and pass them here.
     ///
+    /// member: The member acknowledging — the party whose key will sign this. Refused unless
+    ///         the grant names exactly this identifier as its subject.
     /// valid_from: The datetime from which this credential is valid
-    /// valid_until: Optional: The datetime this credential is valid until
+    /// valid_until: Optional: The datetime this credential is valid until. Must not be later
+    ///              than the grant's own `validUntil`, and must be set if the grant's is.
     ///
     /// # Errors
     ///
@@ -101,15 +187,84 @@ impl DTGCredential {
     /// `credentialSubject.id`, or already carries a `digest` — that last is an
     /// acknowledgement, and acknowledging one does not form an edge.
     ///
+    /// It is also [DTGCredentialError::NotAMembershipGrant] if the grant carries a
+    /// `validUntil` that is not an RFC 3339 timestamp.
+    ///
+    /// [DTGCredentialError::NotTheGrantSubject] if the grant's `credentialSubject.id` is not
+    /// `member`.
+    ///
+    /// [DTGCredentialError::OutlivesGrant] if the grant expires and `valid_until` is later
+    /// than it, or absent.
+    ///
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`, and [DTGCredentialError::JsonTooDeep] if the grant is nested more deeply
+    /// than [crate::MAX_JSON_DEPTH].
+    ///
     /// # Give it an `id`
     ///
     /// Chain [DTGCredential::with_id] on before signing. A community keys a member's VMC by
     /// `id` to tell a re-send from a renewal.
+    ///
+    /// # Security
+    ///
+    /// The result is binding evidence, not membership. This constructor does not verify the
+    /// grant's proof, so it builds an acknowledgement of a grant nobody signed as readily as
+    /// of one the community did. Verify the grant first — with
+    /// `verify_grant_with_public_key` under the `affinidi-signing` feature, or against your
+    /// own resolver — and treat the edge as complete only once both proofs and both windows
+    /// have verified.
+    ///
+    /// Pass as `member` the identity whose key will sign the acknowledgement, established
+    /// independently of the grant. An identifier read out of the grant would make the check
+    /// compare the grant with itself.
+    pub fn new_member_vmc_for(
+        grant: &Value,
+        member: &str,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+    ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, valid_until)?;
+
+        let (found, community) = Self::read_membership_grant(grant)?;
+        if found != member {
+            return Err(DTGCredentialError::NotTheGrantSubject {
+                expected: member.to_string(),
+                found,
+            });
+        }
+        let grant_valid_until =
+            grant_valid_until(grant).map_err(DTGCredentialError::NotAMembershipGrant)?;
+        check_within_grant(valid_until, grant_valid_until)?;
+
+        Self::assemble_member_vmc(grant, found, community, valid_from, valid_until)
+    }
+
+    /// Creates a member-issued VMC without checking who the grant names or when it expires.
+    ///
+    /// Identical to [DTGCredential::new_member_vmc_for] except that the member is taken from
+    /// the grant with nothing to compare it against, and the grant's `validUntil` is not
+    /// consulted.
+    #[deprecated(
+        since = "0.10.0",
+        note = "Takes the member from the grant without comparing it to anything, and lets \
+                the acknowledgement outlive the grant. Use DTGCredential::new_member_vmc_for, \
+                which takes the member you expect and refuses a grant naming anyone else. \
+                This constructor will be removed in a future release."
+    )]
     pub fn new_member_vmc(
         grant: &Value,
         valid_from: DateTime<Utc>,
         valid_until: Option<DateTime<Utc>>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, valid_until)?;
+
+        let (member, community) = Self::read_membership_grant(grant)?;
+        Self::assemble_member_vmc(grant, member, community, valid_from, valid_until)
+    }
+
+    /// Reads the member and the community off a membership grant in its wire form, refusing
+    /// anything that is not a community-issued grant.
+    fn read_membership_grant(grant: &Value) -> Result<(String, String), DTGCredentialError> {
         let object = grant
             .as_object()
             .ok_or_else(|| DTGCredentialError::NotAMembershipGrant("not a JSON object".into()))?;
@@ -160,16 +315,20 @@ impl DTGCredential {
             })?
             .to_string();
 
-        // `issuer` is a string or an object with an `id`, per the W3C data model.
-        let community = object
-            .get("issuer")
-            .and_then(|i| {
-                i.as_str()
-                    .map(str::to_string)
-                    .or_else(|| i.get("id").and_then(Value::as_str).map(str::to_string))
-            })
+        let community = issuer_of(object)
             .ok_or_else(|| DTGCredentialError::NotAMembershipGrant("no `issuer`".into()))?;
 
+        Ok((member, community))
+    }
+
+    /// Assembles the acknowledgement once the grant has been read and every check has passed.
+    fn assemble_member_vmc(
+        grant: &Value,
+        member: String,
+        community: String,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+    ) -> Result<Self, DTGCredentialError> {
         let mut vmc = DTGCommon {
             issuer: member,
             valid_from,
@@ -261,6 +420,11 @@ impl DTGCredential {
     /// here. Nothing about the subject's current standing is consulted when a VAC is
     /// verified, so authority that does not expire is authority nobody can withdraw by
     /// waiting.
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`, and [DTGCredentialError::EmptyAuthorityActions] if `actions` is empty.
     pub fn new_vac(
         issuer: String,
         subject: String,
@@ -269,6 +433,8 @@ impl DTGCredential {
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
         if actions.is_empty() {
             return Err(DTGCredentialError::EmptyAuthorityActions);
         }
@@ -327,7 +493,7 @@ impl DTGCredential {
     /// this in-memory credential. That is right for a VAC this process built and signed.
     /// For one that **arrived from a counterparty**, use
     /// [DTGCredential::attenuate_from_json] and give it the bytes you received — the same
-    /// distinction [DTGCredential::new_member_vmc] draws, and for the same reason.
+    /// distinction [DTGCredential::new_member_vmc_for] draws, and for the same reason.
     pub fn attenuate(
         &self,
         subject: String,
@@ -372,6 +538,9 @@ impl DTGCredential {
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        // Before any member is read out: reading clones one, and cloning recurses.
+        crate::check_json_depth(parent)?;
+
         let object = parent
             .as_object()
             .ok_or(DTGCredentialError::NotAnAuthorityCredential)?;
@@ -441,6 +610,8 @@ impl DTGCredential {
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
         if actions.is_empty() {
             return Err(DTGCredentialError::EmptyAuthorityActions);
         }
@@ -503,7 +674,7 @@ impl DTGCredential {
     ///
     /// # The edge is not complete without the acceptance
     ///
-    /// This is one half. The delegate answers with [DTGCredential::new_delegate_vdc], and
+    /// This is one half. The delegate answers with [DTGCredential::new_delegate_vdc_for], and
     /// a verifier MUST obtain and verify that half before accepting any party as acting
     /// under the delegation: a grant alone establishes what the delegator appointed, not
     /// what the delegate agreed to. Same consent rule as a membership edge, and for the
@@ -525,7 +696,9 @@ impl DTGCredential {
     ///
     /// # Errors
     ///
-    /// [DTGCredentialError::MalformedDelegation] if `scope` is empty.
+    /// [DTGCredentialError::MalformedDelegation] if `scope` is empty, and
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`.
     pub fn new_vdc(
         issuer: String,
         subject: String,
@@ -534,6 +707,8 @@ impl DTGCredential {
         scope: Vec<String>,
         max_depth: Option<u32>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
         if scope.is_empty() {
             return Err(DTGCredentialError::MalformedDelegation(
                 "a grant MUST carry at least one `scope` entry — a VDC cannot express an \
@@ -586,6 +761,8 @@ impl DTGCredential {
     /// [DTGCredentialError::MalformedDelegation] if `self` is not a delegation grant, if
     /// it does not permit re-delegation, if `scope` is empty or not a subset of the
     /// parent's, or if `valid_until` is later than the parent's.
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`.
     pub fn redelegate(
         &self,
         subject: String,
@@ -647,6 +824,8 @@ impl DTGCredential {
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
         if parent_grant.accepts.is_some() {
             return Err(DTGCredentialError::MalformedDelegation(
                 "the parent is an acceptance, not a grant — an acceptance appoints nobody \
@@ -730,7 +909,7 @@ impl DTGCredential {
     ///
     /// # Takes the grant in its wire form, deliberately
     ///
-    /// Same reasoning as [DTGCredential::new_member_vmc]: the digest has to cover the
+    /// Same reasoning as [DTGCredential::new_member_vmc_for]: the digest has to cover the
     /// document the delegator will recompute it over. Keep the bytes you were given and
     /// pass them here.
     ///
@@ -740,11 +919,79 @@ impl DTGCredential {
     /// `DelegationCredential` in its `type`, has no `issuer` or `credentialSubject.id`, or
     /// already carries `accepts` — that last is itself an acceptance, and accepting one
     /// forms no edge.
+    ///
+    /// It is also [DTGCredentialError::NotADelegationGrant] if the grant carries a
+    /// `validUntil` that is not an RFC 3339 timestamp.
+    ///
+    /// [DTGCredentialError::NotTheGrantSubject] if the grant's `credentialSubject.id` is not
+    /// `delegate`.
+    ///
+    /// [DTGCredentialError::OutlivesGrant] if `valid_until` is later than the grant's.
+    ///
+    /// [DTGCredentialError::InvalidValidityWindow] if `valid_until` is not after
+    /// `valid_from`, and [DTGCredentialError::JsonTooDeep] if the grant is nested more deeply
+    /// than [crate::MAX_JSON_DEPTH].
+    ///
+    /// # Security
+    ///
+    /// The result is binding evidence, not an appointment. This constructor does not verify
+    /// the grant's proof, so it builds an acceptance of a grant nobody signed as readily as of
+    /// one the delegator did. Verify the grant first — with `verify_grant_with_public_key`
+    /// under the `affinidi-signing` feature, or against your own resolver — and treat the edge
+    /// as complete only once both proofs and both windows have verified.
+    ///
+    /// Pass as `delegate` the identity whose key will sign the acceptance, established
+    /// independently of the grant. An identifier read out of the grant would make the check
+    /// compare the grant with itself.
+    pub fn new_delegate_vdc_for(
+        grant: &Value,
+        delegate: &str,
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
+        let (found, delegator) = Self::read_delegation_grant(grant)?;
+        if found != delegate {
+            return Err(DTGCredentialError::NotTheGrantSubject {
+                expected: delegate.to_string(),
+                found,
+            });
+        }
+        let grant_valid_until =
+            grant_valid_until(grant).map_err(DTGCredentialError::NotADelegationGrant)?;
+        check_within_grant(Some(valid_until), grant_valid_until)?;
+
+        Self::assemble_delegate_vdc(grant, found, delegator, valid_from, valid_until)
+    }
+
+    /// Creates a delegate-issued acceptance without checking who the grant appoints or when it
+    /// expires.
+    ///
+    /// Identical to [DTGCredential::new_delegate_vdc_for] except that the delegate is taken
+    /// from the grant with nothing to compare it against, and the grant's `validUntil` is not
+    /// consulted.
+    #[deprecated(
+        since = "0.10.0",
+        note = "Takes the delegate from the grant without comparing it to anything, and lets \
+                the acceptance outlive the grant. Use DTGCredential::new_delegate_vdc_for, \
+                which takes the delegate you expect and refuses a grant appointing anyone \
+                else. This constructor will be removed in a future release."
+    )]
     pub fn new_delegate_vdc(
         grant: &Value,
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, Some(valid_until))?;
+
+        let (delegate, delegator) = Self::read_delegation_grant(grant)?;
+        Self::assemble_delegate_vdc(grant, delegate, delegator, valid_from, valid_until)
+    }
+
+    /// Reads the delegate and the delegator off a delegation grant in its wire form, refusing
+    /// anything that is not a grant.
+    fn read_delegation_grant(grant: &Value) -> Result<(String, String), DTGCredentialError> {
         let object = grant
             .as_object()
             .ok_or_else(|| DTGCredentialError::NotADelegationGrant("not a JSON object".into()))?;
@@ -803,16 +1050,20 @@ impl DTGCredential {
             })?
             .to_string();
 
-        // `issuer` is a string or an object with an `id`, per the W3C data model.
-        let delegator = object
-            .get("issuer")
-            .and_then(|i| {
-                i.as_str()
-                    .map(str::to_string)
-                    .or_else(|| i.get("id").and_then(Value::as_str).map(str::to_string))
-            })
+        let delegator = issuer_of(object)
             .ok_or_else(|| DTGCredentialError::NotADelegationGrant("no `issuer`".into()))?;
 
+        Ok((delegate, delegator))
+    }
+
+    /// Assembles the acceptance once the grant has been read and every check has passed.
+    fn assemble_delegate_vdc(
+        grant: &Value,
+        delegate: String,
+        delegator: String,
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> Result<Self, DTGCredentialError> {
         let mut vdc = DTGCommon {
             issuer: delegate,
             valid_from,
@@ -842,6 +1093,9 @@ impl DTGCredential {
     fn read_delegation_json(
         doc: &Value,
     ) -> Result<(String, DelegationGrant, Option<DateTime<Utc>>), DTGCredentialError> {
+        // Before any member is read out: reading clones one, and cloning recurses.
+        crate::check_json_depth(doc)?;
+
         let object = doc
             .as_object()
             .ok_or_else(|| DTGCredentialError::MalformedDelegation("not a JSON object".into()))?;
@@ -931,6 +1185,18 @@ impl DTGCredential {
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
     /// endorsement: The endorsement details for this credential
+    ///
+    /// # Security
+    ///
+    /// `endorsement` is embedded verbatim. The specification does not define its content,
+    /// so its shape is the issuer's to choose and this library checks nothing about it but
+    /// its depth. A VEC says only that its issuer said this: a consumer must verify the
+    /// proof, *and* establish that the issuer is one whose endorsements it accepts for this
+    /// purpose, before relying on any member of it.
+    ///
+    /// Build it from input you control. Nesting past [crate::MAX_JSON_DEPTH] is refused
+    /// when the credential is validated, digested or signed rather than here, because this
+    /// constructor cannot return an error.
     pub fn new_vec(
         issuer: String,
         subject: String,
@@ -1142,6 +1408,14 @@ impl DTGCredential {
     /// Neither [`crate::delegation::verify_chain`] nor [`crate::authority::verify_chain`]
     /// resolves a status entry; both verify structure, scope and validity only. Revocation
     /// is a live lookup the caller performs.
+    ///
+    /// # Security
+    ///
+    /// The entry is embedded verbatim and nothing about it is checked when it is attached.
+    /// It tells a verifier where to look, so a verifier must check the credential's proof
+    /// before following it, and should apply its own policy to where it leads. Nesting past
+    /// [crate::MAX_JSON_DEPTH] is refused when the credential is validated, digested or
+    /// signed, because this setter cannot return an error.
     pub fn with_credential_status(mut self, status: Value) -> Self {
         self.credential.credential_status = Some(status);
         self
@@ -1150,7 +1424,7 @@ impl DTGCredential {
     /// Attaches a revocation status mechanism in place.
     ///
     /// The non-consuming form of [DTGCredential::with_credential_status]; the same "before
-    /// signing" caveat and the same CONDITIONAL rule apply.
+    /// signing" caveat, the same CONDITIONAL rule and the same security notes apply.
     pub fn set_credential_status(&mut self, status: Value) {
         self.credential.credential_status = Some(status);
     }
