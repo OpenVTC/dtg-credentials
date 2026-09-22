@@ -422,11 +422,16 @@ worth stating for each breaking release:
 | 0.7.0 | `parent` became a `digestMultibase`; `digest` → `digestMultibase` | Verifiers first |
 | 0.8.0 | `authority::verify_chain` requires the leaf to grant to `presenter`; `audience` removed | Verifiers first |
 | 0.9.1 | `delegation::verify_chain` requires the leaf to appoint `presenter` | Verifiers first |
-| 0.10.0 | Validity-window and JSON-depth checks at issue and verify; `DTGCredentialError` is `#[non_exhaustive]` | Verifiers first |
+| 0.10.0 (first published in 0.11.0) | Validity-window and JSON-depth checks at issue and verify; `DTGCredentialError` is `#[non_exhaustive]` | Verifiers first |
+| 0.11.0 | `taskDigestMultibase` added; `DTGCommon` gains a field; `new_vwc` deprecated | Any order |
 
-Every one of them is *verifiers first*, and for the same reason: each made a verifier
-stricter or changed what it reads, so a verifier that moves first accepts everything
-it did before and is ready for what issuers send next.
+Every one through 0.10.0 is *verifiers first*, and for the same reason: each made a
+verifier stricter or changed what it reads, so a verifier that moves first accepts
+everything it did before and is ready for what issuers send next. 0.11.0 has no ordering:
+an older release carries `taskDigestMultibase` through a round trip in `DTGCommon::extra`,
+and nothing changes on the wire for a credential without it. 0.10.0 was never published
+to crates.io, so a consumer on 0.9.x takes 0.10.0 and 0.11.0 together, and verifiers
+first still applies.
 
 `0.8.0` and `0.9.1` are API breaks rather than wire changes — no credential changes
 shape — but they land in the same place: a caller that upgrades gets a compile error
