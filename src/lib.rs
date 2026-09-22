@@ -120,6 +120,20 @@ pub enum DTGCredentialError {
     #[error("WitnessCredential is missing the required taskContext property")]
     MissingTaskContext,
 
+    /// A document a credential was to cite as its `taskContext` is not a Trust Task
+    /// document that can be named: it is not a JSON object, or it has no string `id`.
+    #[error("cannot cite this document as a taskContext: {0}")]
+    MalformedTaskDocument(String),
+
+    /// [DTGCredential::new_vwc_for_session] was given something other than the
+    /// `witness/session` document that opened the witness session.
+    ///
+    /// A VWC names the *innermost* exchange that attests the witnessing (Trust Tasks
+    /// §4.9.1): the party's own `witness/session`, not the `witness/session/submit`
+    /// exchanged on its thread and not the relationship exchange that contains it.
+    #[error("not the witness/session document that opened the session: {0}")]
+    NotAWitnessSession(String),
+
     /// The credential could not be canonicalized (JCS, RFC 8785) for digesting
     #[error("Could not canonicalize credential: {0}")]
     Canonicalization(String),
@@ -257,12 +271,69 @@ impl DTGCredential {
         self.credential.valid_until()
     }
 
-    /// The `threadId` of the trust task exchange this credential was issued in, if set
+    /// The `id` naming the trust task exchange this credential cites, if set. See
+    /// [DTGCommon::task_context].
     ///
     /// This is always `Some` for [DTGCredentialType::Witness] credentials, where the spec
     /// makes `taskContext` REQUIRED.
     pub fn task_context(&self) -> Option<&str> {
         self.credential.task_context()
+    }
+
+    /// The task digest of the Trust Task document `taskContext` names, if set. See
+    /// [DTGCommon::task_digest_multibase].
+    pub fn task_digest_multibase(&self) -> Option<&str> {
+        self.credential.task_digest_multibase()
+    }
+
+    /// Does this credential cite `document` — the Trust Task document its `taskContext`
+    /// names — and is it bound to that document's content?
+    ///
+    /// Both halves of the citation have to hold:
+    ///
+    /// 1. `taskContext` equals the document's `id`, which **locates** the exchange;
+    /// 2. `taskDigestMultibase` matches the task digest recomputed from `document`, which
+    ///    **binds** the credential to it.
+    ///
+    /// Returns `Ok(false)` where either fails, and where the credential carries no
+    /// `taskContext` or no `taskDigestMultibase`. The last case is deliberate: Trust Tasks
+    /// §4.9.3 forbids falling back to comparing `id`s alone, because an `id` is a name
+    /// anyone may reuse on a counterfeit.
+    ///
+    /// # Compares bytes, not strings
+    ///
+    /// The digest is recomputed with the top-level `proof` removed, so a signed and an
+    /// unsigned copy of the same document agree, and compared as **decoded multihash bytes**.
+    /// A task digest may be base58btc or base64url: two conforming encodings of one digest
+    /// are different strings, and a string comparison would reject an honest citation.
+    ///
+    /// # What this does not check
+    ///
+    /// That the exchange completed, which needs the outcome evidence of DTG Core
+    /// Credentials §Outcome Interpretability, and that the document was attributable, which
+    /// needs its own proof. A task digest attests content, not authenticity. It is
+    /// load-bearing because it is the credential's issuer who signed it.
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::InvalidDigest] if the carried value is not a well-formed
+    /// multibase multihash, and [DTGCredentialError::UnsupportedDigestAlgorithm] if it
+    /// names a hash this library does not implement. Trust Tasks §4.9.3 requires such a
+    /// citation to be treated as unverified, never recomputed under another algorithm, so
+    /// it is reported rather than folded into `Ok(false)`. [DTGCredentialError::JsonTooDeep]
+    /// if `document` is nested past [`MAX_JSON_DEPTH`].
+    pub fn cites_task(&self, document: &Value) -> Result<bool, DTGCredentialError> {
+        let (Some(task_context), Some(carried)) =
+            (self.task_context(), self.task_digest_multibase())
+        else {
+            return Ok(false);
+        };
+
+        if document.get("id").and_then(Value::as_str) != Some(task_context) {
+            return Ok(false);
+        }
+
+        digests_match(carried, &task_digest_multibase_json(document)?)
     }
 
     /// This credential's digest, in the encoding a credential that references it carries —
@@ -738,6 +809,39 @@ pub fn digest_multibase_json(doc: &Value) -> Result<String, DTGCredentialError> 
     Ok(multibase::encode(Base::Base58Btc, &multihash))
 }
 
+/// The *task digest* of a Trust Task document, the value a credential carries as
+/// `taskDigestMultibase` alongside the `taskContext` that names the document.
+///
+/// Trust Tasks §4.9.3 *Binding a Citation to the Document It Names* defines it as
+///
+/// ```text
+/// taskDigest = multibase( multihash( H( JCS( document ∖ proof ) ) ) )
+/// ```
+///
+/// where `document ∖ proof` removes the **top-level** `proof` only — a `proof` inside
+/// `payload`, in an embedded presentation or credential, is content and stays. That is
+/// the computation DTG Core Credentials §Digest Encoding already fixes for every other
+/// digest-valued member, with a Trust Task document as the input instead of a credential,
+/// so this is [`digest_multibase_json`] under the name of the question it answers: `H` is
+/// SHA-256 and the encoding base58btc, the single form an issuer of a DTG credential emits.
+///
+/// # Not the digest of the document as it arrived
+///
+/// Trust Tasks names two digests over a document, and they differ only in `proof`. The
+/// task digest asks *what the document says*, so a signed and an unsigned copy have one
+/// value. A *step digest* asks *which serialization arrived* and includes the `proof` —
+/// the document identity `idConflict` is keyed on, and what a `witness/session/submit`
+/// response's `vwcDigestMultibase` is taken over. A function computing one of these must
+/// never stand in for the other; whichever it picks, it is wrong for the other question.
+///
+/// # Errors
+///
+/// [DTGCredentialError::JsonTooDeep] if `document` is nested more deeply than
+/// [`MAX_JSON_DEPTH`].
+pub fn task_digest_multibase_json(document: &Value) -> Result<String, DTGCredentialError> {
+    digest_multibase_json(document)
+}
+
 /// Verifies a grant **in its wire form** before it is answered: that its issuer signed it,
 /// and that it is in force at `at`.
 ///
@@ -1042,7 +1146,14 @@ pub struct DTGCommon {
     )]
     pub valid_until: Option<DateTime<Utc>>,
 
-    /// Identifier (`threadId`) of the trust task exchange in which this credential was issued.
+    /// Names the trust task exchange this credential cites: the `id` of the document that
+    /// initiated the innermost exchange attesting what the credential states (Trust Tasks
+    /// §4.9.1). For `witness/session` that document's `threadId` is its own `id`, so the
+    /// earlier description of this member as the exchange's `threadId` gives the same
+    /// value there; it does not in general, since a `threadId` need not be unique.
+    ///
+    /// Carry [`DTGCommon::task_digest_multibase`] with it, which binds the credential to
+    /// the document this only names.
     ///
     /// REQUIRED for [DTGCredentialType::Witness] credentials, OPTIONAL for all other DTG
     /// credential types. A DTG credential without a `taskContext` MUST be interpretable
@@ -1053,6 +1164,29 @@ pub struct DTGCommon {
     /// also present and verified.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub task_context: Option<String>,
+
+    /// The *task digest* of the Trust Task document [`DTGCommon::task_context`] names.
+    ///
+    /// `taskContext` locates the exchange a credential cites; this binds the credential to
+    /// it. An `id` is only a name, and anyone can write a different document that reuses
+    /// it, so a verifier pairing a credential with the cited document by `id` alone accepts
+    /// a counterfeit.
+    ///
+    /// Computed as Trust Tasks §4.9.3 *Binding a Citation to the Document It Names* defines
+    /// a task digest: the document with its **top-level** `proof` removed (a `proof` inside
+    /// `payload` stays), canonicalized with JCS (RFC 8785), hashed, multihash-tagged and
+    /// multibase-encoded. An issuer uses `sha2-256` and base58btc, as for every other
+    /// digest-valued member of DTG Core Credentials. [`task_digest_multibase_json`] computes
+    /// it; [DTGCredential::with_task_citation] sets it together with `taskContext`.
+    ///
+    /// REQUIRED on a VWC issued through `witness/session` + `witness/session/submit` (the
+    /// latter's Conformance, item 1), and proposed as REQUIRED wherever `taskContext` is
+    /// REQUIRED in DTG Core Credentials (trustoverip/dtgwg-cred-spec#56). It is `Option`
+    /// here, and a VWC without one still deserializes, because every VWC issued before the
+    /// member existed lacks it. [DTGCredential::cites_task] reports such a credential as
+    /// citing nothing rather than falling back to comparing `id`s.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub task_digest_multibase: Option<String>,
 
     /// The assertion between the entities involved
     pub credential_subject: CredentialSubject,
@@ -1189,9 +1323,16 @@ impl DTGCommon {
         self.valid_until
     }
 
-    /// The `threadId` of the trust task exchange this credential was issued in, if set
+    /// The `id` naming the trust task exchange this credential cites, if set. See
+    /// [DTGCommon::task_context].
     pub fn task_context(&self) -> Option<&str> {
         self.task_context.as_deref()
+    }
+
+    /// The task digest of the document `taskContext` names, if set. See
+    /// [DTGCommon::task_digest_multibase].
+    pub fn task_digest_multibase(&self) -> Option<&str> {
+        self.task_digest_multibase.as_deref()
     }
 
     /// Refuses a credential whose open JSON members take the document past
@@ -1241,6 +1382,7 @@ impl Default for DTGCommon {
             valid_from: Utc::now(),
             valid_until: None,
             task_context: None,
+            task_digest_multibase: None,
             credential_subject: CredentialSubject::Basic(CredentialSubjectBasic {
                 id: String::new(),
             }),

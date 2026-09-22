@@ -68,23 +68,63 @@ library and will be removed in a future release.
 ## Trust Task Context
 
 Credentials issued inside a multi-step trust task exchange may carry a
-`taskContext` property holding the `threadId` of that exchange. It is REQUIRED
-on a `WitnessCredential` — deserializing a VWC without one fails with
+`taskContext` property naming that exchange: the `id` of the document that
+initiated the innermost exchange attesting what the credential states. It is
+REQUIRED on a `WitnessCredential` — deserializing a VWC without one fails with
 `DTGCredentialError::MissingTaskContext` — and OPTIONAL on every other type.
+
+An `id` is only a name, and anyone can write a different document that reuses it.
+So a citation also carries `taskDigestMultibase`, the *task digest* of the
+document `taskContext` names (Trust Tasks §4.9.3): the document **with its
+top-level `proof` removed**, canonicalized with JCS, hashed with sha2-256 and
+encoded as a base58btc multibase multihash — the same encoding as every other
+digest in DTG Core Credentials, over a Trust Task document instead of a
+credential. A VWC issued through `witness/session` + `witness/session/submit`
+MUST carry it.
+
+```Rust
+// The witness, answering witness/session/submit on Alice's session.
+let vwc = DTGCredential::new_vwc_for_session(
+  witness, alice, valid_from, valid_until,
+  &session,          // the witness/session document that opened the session
+  vrc_digest,        // digest of the edge credential Alice issued
+  witness_context,
+)?;
+
+assert_eq!(vwc.task_context(), session["id"].as_str());
+assert_eq!(vwc.task_digest_multibase(),
+           Some(dtg_credentials::task_digest_multibase_json(&session)?.as_str()));
+```
+
+`new_vwc_for_session` refuses a document that is not the opening
+`witness/session` — the `submit` document, the witness's response, or anything
+whose `threadId` is not its own `id` — because naming the wrong exchange is the
+easy mistake. `with_task_citation(&document)` sets both members on any other
+credential. `new_vwc` is deprecated: it cannot set the digest.
+
+A verifier checks both halves with `cites_task`:
+
+```Rust
+if vwc.cites_task(&session)? {
+  // `taskContext` is the session's `id`, and `taskDigestMultibase` matches its
+  // recomputed task digest, compared as decoded bytes.
+}
+```
+
+It returns `false` for a credential with no `taskDigestMultibase` rather than
+falling back to comparing `id`s, which Trust Tasks forbids.
+
+> [!IMPORTANT]
+> The task digest is **not** the digest of the document as it arrived. Trust
+> Tasks also defines a *step digest*, which includes the `proof` — the
+> `idConflict` identity, and what `witness/session/submit`'s
+> `vwcDigestMultibase` is taken over. Do not use one for the other.
 
 A credential without a `taskContext` must be interpretable standing alone. A
 credential *with* one must not be read as proof that the trust task completed
-unless the matching outcome evidence is also present and verified.
-
-```Rust
-let vwc = DTGCredential::new_vwc(
-  issuer, subject, valid_from, valid_until,
-  "thread-abc-123".to_string(), // taskContext
-  digest, witness_context,
-);
-
-assert_eq!(vwc.task_context(), Some("thread-abc-123"));
-```
+unless the matching outcome evidence is also present and verified;
+`cites_task` establishes which document a credential names, not that the
+exchange completed.
 
 ## Digests
 
