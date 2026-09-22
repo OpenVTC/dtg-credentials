@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**A credential can bind to the trust task document it cites, not only name it.** Adds
+`taskDigestMultibase`, which the only VWC-issuing flow the specifications define requires
+and which this library could not produce.
+
+> [!IMPORTANT]
+> **API break:** `DTGCommon` has a new public field, `task_digest_multibase`. Construction
+> through `..Default::default()`, as every `new_*` constructor does, is unaffected; an
+> exhaustive struct literal needs the extra field. `new_vwc` is **deprecated**, not
+> removed: it compiles and behaves as before, but a build with `-D warnings` fails until it
+> moves to `new_vwc_for_session`. Nothing changes on the wire for a credential without the
+> new member, and an older release carries one through a round trip in `DTGCommon::extra`,
+> so there is no upgrade ordering.
+
+### Added — `taskDigestMultibase`
+
+`witness/session/submit` (dtgwg-trust-tasks-tf), Conformance item 1: the VWC the witness
+delivers MUST carry `taskContext` equal to the `id` of the `witness/session` document that
+opened the session **and** `taskDigestMultibase` equal to that document's *task digest*
+(Trust Tasks §4.9.3). It leaves the member's schema to DTG Core Credentials, which proposes
+it in trustoverip/dtgwg-cred-spec#56: a top-level member, REQUIRED wherever `taskContext`
+is REQUIRED. An `id` locates the exchange; only the digest binds the credential to it,
+because anyone can write a different document reusing the `id`.
+
+- `DTGCommon::task_digest_multibase`, with accessors on `DTGCommon` and `DTGCredential`.
+  Modelled, so a non-string value is refused at parse. A VWC without one still
+  deserializes, since every VWC issued before now lacks it.
+- `task_digest_multibase_json(document)`: the task digest — the document with its
+  **top-level** `proof` removed (a `proof` inside `payload` stays), JCS, sha2-256 multihash,
+  base58btc. That is `digest_multibase_json` over a Trust Task document instead of a
+  credential; the separate name is there because Trust Tasks also defines a *step digest*
+  that includes the `proof`, and the two must not stand in for each other.
+- `DTGCredential::new_vwc_for_session(issuer, subject, valid_from, valid_until, &session,
+  digest, witness_context)` reads both `taskContext` and `taskDigestMultibase` from the
+  `witness/session` document, so the pair cannot disagree. It takes the edge digest as
+  REQUIRED, and refuses a document that is not the opening `witness/session` — a
+  `witness/session/submit` document, a `#response`, or one whose `threadId` is not its own
+  `id` — with the new `DTGCredentialError::NotAWitnessSession`.
+- `DTGCredential::with_task_citation(&document)` / `set_task_citation` set both members
+  from one document on any credential type, e.g. a `vetting/session` statement.
+- `DTGCredential::cites_task(&document)` checks that `taskContext` is the document's `id`
+  and that `taskDigestMultibase` matches its recomputed task digest, comparing decoded
+  multihash bytes. A credential with no `taskDigestMultibase` is `Ok(false)`, never an
+  `id`-only match; an algorithm this library does not implement is an error, never a
+  recompute under sha2-256.
+- `DTGCredentialError::MalformedTaskDocument` for a document with no string `id`.
+
+The test vector is not ours: `tests/task_citation.rs` reproduces the `taskDigestMultibase`
+printed in `vetting/session/0.1` for its session document, and verifies the Vetting
+Statement printed there against it.
+
+### Deprecated
+
+- `DTGCredential::new_vwc`. It cannot set `taskDigestMultibase`. Use
+  `new_vwc_for_session`.
+
+### Changed
+
+- `taskContext` is documented as the `id` of the document that initiated the innermost
+  exchange (Trust Tasks §4.9.1), not a `threadId`. For `witness/session` the two are equal;
+  in general a `threadId` need not be unique.
+
 ## [0.10.0] - 2026-09-11
 
 **Issue-time validation, and a way to answer a grant only on your own behalf.** No function

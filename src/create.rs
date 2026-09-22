@@ -35,6 +35,57 @@ pub(crate) fn check_window(
     }
 }
 
+/// The `type` prefix every version of `witness/session` shares.
+const WITNESS_SESSION_TYPE_PREFIX: &str = "https://trusttasks.org/spec/witness/session/";
+
+/// Refuses anything but the `witness/session` document that opened a witness session.
+///
+/// Two checks, both about naming the right exchange. The `type` must be
+/// `witness/session/<major>.<minor>` exactly — `witness/session/submit/0.1` shares the
+/// prefix and is the likeliest wrong document to hold, and a `#response` fragment is the
+/// witness's answer, not the opening document. And `threadId` must equal `id`, which
+/// `witness/session` Conformance, item 1, requires of the opening document.
+pub(crate) fn check_witness_session(session: &Value) -> Result<(), DTGCredentialError> {
+    let object = session
+        .as_object()
+        .ok_or_else(|| DTGCredentialError::MalformedTaskDocument("not a JSON object".into()))?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DTGCredentialError::MalformedTaskDocument("no string `id`".into()))?;
+
+    let type_ = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_version = |v: &str| {
+        v.split_once('.').is_some_and(|(major, minor)| {
+            !major.is_empty()
+                && !minor.is_empty()
+                && major.bytes().all(|b| b.is_ascii_digit())
+                && minor.bytes().all(|b| b.is_ascii_digit())
+        })
+    };
+    if !type_
+        .strip_prefix(WITNESS_SESSION_TYPE_PREFIX)
+        .is_some_and(is_version)
+    {
+        return Err(DTGCredentialError::NotAWitnessSession(format!(
+            "`type` is `{type_}`"
+        )));
+    }
+
+    match object.get("threadId").and_then(Value::as_str) {
+        Some(thread_id) if thread_id == id => Ok(()),
+        Some(thread_id) => Err(DTGCredentialError::NotAWitnessSession(format!(
+            "`threadId` `{thread_id}` is not the document's own `id` `{id}`"
+        ))),
+        None => Err(DTGCredentialError::NotAWitnessSession(
+            "no `threadId`; the opening document names its own thread".into(),
+        )),
+    }
+}
+
 /// The issuer of a credential in its wire form: a string, or an object carrying an `id`, per
 /// the W3C data model.
 pub(crate) fn issuer_of(credential: &serde_json::Map<String, Value>) -> Option<String> {
@@ -1224,7 +1275,78 @@ impl DTGCredential {
         }
     }
 
+    /// Creates a Verifiable Witness Credential (VWC) for a `witness/session`, citing the
+    /// session by `taskContext` **and** `taskDigestMultibase`.
+    ///
+    /// This is the constructor for the only VWC-issuing flow the specifications define:
+    /// the witness, answering `witness/session/submit` on the party's session, delivers the
+    /// VWC in the response. That specification's Conformance, item 1, requires the VWC's
+    /// `taskContext` to be the `id` of the `witness/session` document that opened the
+    /// session and its `taskDigestMultibase` to be that document's task digest. Both are
+    /// read from `session` here, so the pair cannot disagree.
+    ///
+    /// - `issuer`: the witness's DID — a member's identifier, or the DID of a VTA acting
+    ///   according to VTC policy.
+    /// - `subject`: the DID of the party observed **issuing** the edge credential that
+    ///   `digest` names, i.e. that credential's `issuer`. One VWC per direction.
+    /// - `session`: the `witness/session` document, as received. Its top-level `proof`, if
+    ///   any, is excluded from the digest, so a signed and an unsigned copy give one value.
+    /// - `digest`: the witnessed edge credential's digest, from
+    ///   [DTGCredential::digest_multibase] or [crate::digest_multibase_json]. REQUIRED
+    ///   here, unlike [DTGCredential::new_vwc]: a VWC without it does not say which edge
+    ///   was witnessed.
+    ///
+    /// # Errors
+    ///
+    /// - [DTGCredentialError::MalformedTaskDocument] if `session` is not an object with a
+    ///   string `id`.
+    /// - [DTGCredentialError::NotAWitnessSession] if its `type` is not a `witness/session`
+    ///   version, or its `threadId` is not its own `id`. `witness/session` requires the
+    ///   opening document to name its own thread, so a document whose `threadId` differs
+    ///   is a later document of some exchange, not the one that opened this one. Both
+    ///   checks exist to catch citing the wrong exchange: the `submit` document, or the
+    ///   relationship exchange the session is nested in.
+    /// - [DTGCredentialError::InvalidValidityWindow] for a window that closes before it
+    ///   opens, and [DTGCredentialError::JsonTooDeep] for a `session` nested past
+    ///   [crate::MAX_JSON_DEPTH].
+    ///
+    /// # Security
+    ///
+    /// Pass the session document the witness itself received and answered, not one the
+    /// party supplies alongside its submission. The digest is load-bearing because the
+    /// witness signs it: it is how a verifier later tells this session from a counterfeit
+    /// reusing its `id`.
+    pub fn new_vwc_for_session(
+        issuer: String,
+        subject: String,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+        session: &Value,
+        digest: String,
+        witness_context: Option<WitnessContext>,
+    ) -> Result<Self, DTGCredentialError> {
+        check_window(valid_from, valid_until)?;
+        check_witness_session(session)?;
+
+        #[allow(deprecated)]
+        let vwc = Self::new_vwc(
+            issuer,
+            subject,
+            valid_from,
+            valid_until,
+            String::new(),
+            Some(digest),
+            witness_context,
+        );
+        vwc.with_task_citation(session)
+    }
+
     /// Creates a new Verified Witness Credential (VWC)
+    ///
+    /// Carries no `taskDigestMultibase`, so the VWC names its session by `id` alone. Use
+    /// [DTGCredential::new_vwc_for_session], which reads both halves of the citation from
+    /// the session document.
+    ///
     /// issuer: The issuer DID of the credential - a member's identifier, or the DID of a
     ///         VTA acting according to VTC policy
     /// subject: The DID of the observed party. For a witnessed bi-directional exchange this
@@ -1241,6 +1363,13 @@ impl DTGCredential {
     ///         requirement still has to deserialize. A VWC without one identifies the
     ///         observed party and the exchange, but not which edge was witnessed.
     /// witness_context: Optional Semantic context for the witness
+    #[deprecated(
+        since = "0.11.0",
+        note = "A VWC issued through witness/session MUST carry taskDigestMultibase, the \
+                task digest of the session document, beside taskContext \
+                (witness/session/submit Conformance, item 1), and this constructor cannot \
+                set it. Use DTGCredential::new_vwc_for_session."
+    )]
     pub fn new_vwc(
         issuer: String,
         subject: String,
@@ -1349,6 +1478,51 @@ impl DTGCredential {
     /// applies.
     pub fn set_id(&mut self, id: impl Into<String>) {
         self.credential.id = Some(id.into());
+    }
+
+    /// Cites a Trust Task document: sets `taskContext` to its `id` and
+    /// `taskDigestMultibase` to its task digest, together.
+    ///
+    /// Use it for any credential whose meaning depends on an exchange — a VWC, or a
+    /// statement a `vetting/session` produces. Name the **innermost** exchange that attests
+    /// what the credential states, by the document that initiated it (Trust Tasks §4.9.1).
+    /// Setting both halves from one document is the point: the `id` locates the exchange
+    /// and the digest binds the credential to it, and a pair taken from two places binds
+    /// nothing. See [crate::task_digest_multibase_json] for how the digest is computed.
+    ///
+    /// Replaces a `taskContext` and `taskDigestMultibase` already set.
+    ///
+    /// # Set it before signing
+    ///
+    /// Both members are covered by the credential's proof, as for [DTGCredential::with_id].
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::MalformedTaskDocument] if `document` is not an object with a
+    /// string `id`; [DTGCredentialError::JsonTooDeep] if it is nested past
+    /// [crate::MAX_JSON_DEPTH].
+    pub fn with_task_citation(mut self, document: &Value) -> Result<Self, DTGCredentialError> {
+        self.set_task_citation(document)?;
+        Ok(self)
+    }
+
+    /// Cites a Trust Task document in place.
+    ///
+    /// The non-consuming form of [DTGCredential::with_task_citation]; the same caveats
+    /// apply. On error, the credential is left unchanged.
+    pub fn set_task_citation(&mut self, document: &Value) -> Result<(), DTGCredentialError> {
+        let id = document
+            .as_object()
+            .ok_or_else(|| DTGCredentialError::MalformedTaskDocument("not a JSON object".into()))?
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DTGCredentialError::MalformedTaskDocument("no string `id`".into()))?
+            .to_string();
+        let digest = crate::task_digest_multibase_json(document)?;
+
+        self.credential.task_context = Some(id);
+        self.credential.task_digest_multibase = Some(digest);
+        Ok(())
     }
 
     /// Attaches the status mechanism through which a verifier determines whether this
