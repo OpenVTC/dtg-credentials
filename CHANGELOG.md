@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-22
+
+**The first published release since 0.9.1.** 0.10.0 was never published to crates.io, so
+this release carries both 0.10.0's changes (issue-time validation, the `_for` grant
+constructors) and the `taskDigestMultibase` work below. A consumer on 0.9.x crosses both
+at once; see *Upgrading from 0.9* at the end of this section before bumping.
+
 **A credential can bind to the trust task document it cites, not only name it.** Adds
 `taskDigestMultibase`, which the only VWC-issuing flow the specifications define requires
 and which this library could not produce.
@@ -68,7 +75,40 @@ Statement printed there against it.
   exchange (Trust Tasks §4.9.1), not a `threadId`. For `witness/session` the two are equal;
   in general a `threadId` need not be unique.
 
+### Upgrading from 0.9
+
+Three compile-time changes, none of which changes a credential on the wire:
+
+1. **`DTGCredentialError` is `#[non_exhaustive]`** (from 0.10.0). An exhaustive `match`
+   on it needs a wildcard arm. It also gains nine variants across the two releases:
+   `InvalidValidityWindow`, `JsonTooDeep`, `MalformedCredential`, `NotTheGrantSubject`,
+   `NotValidAt`, `OutlivesGrant` and `ProofNotFromIssuer` in 0.10.0, and
+   `NotAWitnessSession` and `MalformedTaskDocument` here.
+2. **Three constructors are deprecated, not removed.** They compile and behave as before,
+   but a build with `-D warnings` fails until each is replaced:
+   - `new_member_vmc` → `new_member_vmc_for(grant, member, …)` (0.10.0)
+   - `new_delegate_vdc` → `new_delegate_vdc_for(grant, delegate, …)` (0.10.0)
+   - `new_vwc` → `new_vwc_for_session(…, &session, digest, witness_context)` (0.11.0)
+
+   The `_for` forms take the party you expect the grant to name and refuse a mismatch;
+   pass the identity whose key will sign the answer, established independently of the
+   grant.
+3. **`DTGCommon` has a new public field, `task_digest_multibase`** (0.11.0). Construction
+   through `..Default::default()` is unaffected; an exhaustive struct literal needs the
+   extra field.
+
+Behaviourally, 0.10.0 also refuses more at issue and verify time: a validity window that
+does not open before it closes, and JSON nested past `MAX_JSON_DEPTH`. A conforming issuer
+emits neither. Those checks make a verifier stricter, so upgrade **verifiers first**, as
+for 0.10.0; the 0.11.0 change adds no ordering of its own. The 0.10.0 section below has the
+detail.
+
 ## [0.10.0] - 2026-09-11
+
+> [!NOTE]
+> **Never published to crates.io.** 0.10.0 was merged and versioned but no `v0.10.0` tag
+> was pushed, so crates.io went from 0.9.1 to 0.11.0. Everything below first ships in
+> 0.11.0, and a consumer upgrading from 0.9.x takes both sections at once.
 
 **Issue-time validation, and a way to answer a grant only on your own behalf.** No function
 signatures change, and nothing changes on the wire for a well-formed credential. Several
