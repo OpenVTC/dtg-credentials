@@ -86,14 +86,18 @@ pub struct AcceptListEntry {
 }
 
 /// The registry's `accept-list.json`, per its `meta/accept-list.schema.json`.
+///
+/// Unknown members of the envelope are ignored, so build metadata the registry adds or
+/// drops (it dropped `revision` when it stopped tagging releases) never breaks loading.
+/// Entries stay strict: an unknown member there could be a constraint this version does
+/// not know how to apply, and failing closed is the only safe reading of it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RegistryAcceptList {
     #[serde(rename = "$schema")]
     pub schema: String,
     pub namespace: String,
-    /// The release tag the list was built at, or `unreleased`.
-    pub revision: String,
+    /// The registry commit the list was built from. Pin this, or the list's digest.
     pub commit: String,
     pub generated_at: String,
     /// Every published predicate version, keyed by IRI.

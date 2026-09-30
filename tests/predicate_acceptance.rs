@@ -65,7 +65,6 @@ fn registry_accept_list() -> Value {
     json!({
         "$schema": "https://registry.trustoverip.org/dtg/meta/v1/accept-list.schema.json",
         "namespace": "https://registry.trustoverip.org/dtg/vsc/",
-        "revision": "unreleased",
         "commit": "eb29484",
         "generatedAt": "2026-09-30T10:00:00Z",
         "predicates": {
@@ -235,6 +234,18 @@ fn an_accept_list_with_an_unknown_constraint_is_refused() {
     assert!(PredicateAcceptList::from_registry_json(&list.to_string(), &all_statuses()).is_err());
 
     assert!(PredicateAcceptList::from_registry_json("[]", &all_statuses()).is_err());
+}
+
+/// Build metadata on the envelope is not a constraint, so a list carrying members this
+/// version does not know (the `revision` older registry builds emitted) still loads.
+#[test]
+fn unknown_envelope_metadata_is_ignored() {
+    let mut list = registry_accept_list();
+    list["revision"] = json!("unreleased");
+    list["builtBy"] = json!("a future build step");
+    let accepted = PredicateAcceptList::from_registry_json(&list.to_string(), &all_statuses())
+        .expect("envelope metadata never blocks loading");
+    assert!(accepted.contains(ENDORSES_V1));
 }
 
 /// A community predicate's registry constraints are applied: object kind, minimum scope,

@@ -83,8 +83,10 @@ bumping.
   `accept-list.json` (types `RegistryAcceptList`, `AcceptListEntry`, `AdditionalMember`,
   `PredicateStatus`). `accept(&vsc)` validates the statement, matches its predicate exactly
   — no equivalence is followed — and applies the entry's constraints (object kind,
-  `taskContext`, minimum `issuerScope`, required members). An unknown member in the
-  registry document is refused rather than ignored.
+  `taskContext`, minimum `issuerScope`, required members). An unknown member of a
+  predicate entry is refused rather than ignored, since it may be a constraint this
+  version cannot apply; unknown build metadata on the envelope is ignored. The envelope
+  carries `commit`, which is what a verifier pins (the registry does not tag releases).
 
 ### Added — VAC `maxAttenuation` and role VACs
 
