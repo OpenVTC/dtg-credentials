@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-30
+
 **Conformance to the current DTG Core Credentials draft (Working Draft 0.6.0) and its frozen
 v1 context.** Every credential this release emits differs on the wire from what 0.11 emitted,
 and every credential 0.11 emitted is refused here. See *Upgrading from 0.11* below before
