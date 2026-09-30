@@ -1,13 +1,16 @@
 # Decentralized Trust Graph (DTG) Credentials
 
 **_NOTE:_** This is an early implementation of the [DTG Core Credentials
-specification](https://github.com/trustoverip/dtgwg-cred-spec) (v1.0, Working
-Draft 02), which supersedes the earlier v0.3 proposal draft.
+specification](https://github.com/trustoverip/dtgwg-cred-spec) (v1.0, Document
+Status Working Draft 0.6.0), using the frozen v1 credential context
+`https://registry.trustoverip.org/dtg/context/v1` published by the DTG VSC
+Predicate Registry.
 
 See the [First Person Project Whitepaper](https://www.firstperson.network/white-paper)
 for more information.
 
-This library supports both W3C VC 1.1 and 2.0 specifications.
+This library issues W3C VC 2.0 credentials and also parses 1.1 ones (the spec's
+legacy compatibility profile), provided they list the DTG v1 context second.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -43,10 +46,39 @@ VerifiableCredential
     ├── DelegationCredential (VDC)
     ├── InvitationCredential (VIC)
     ├── PersonaCredential (VPC)
-    ├── EndorsementCredential (VEC)
-    ├── WitnessCredential (VWC)
+    ├── StatementCredential (VSC)
+    │     ├── profile endorses/1 (VEC)
+    │     ├── profile witnessed/1 (VWC)
+    │     ├── profile vetted/1
+    │     └── profile presented/1
     └── AuthorityCredential (VAC)
 ```
+
+Every credential this library emits looks like this:
+
+```json
+{
+  "@context": [
+    "https://www.w3.org/ns/credentials/v2",
+    "https://registry.trustoverip.org/dtg/context/v1"
+  ],
+  "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
+  "issuer": "did:example:community",
+  "issuerScope": "public",
+  "validFrom": "2026-01-06T10:00:00Z",
+  "credentialSubject": { "id": "did:example:member" }
+}
+```
+
+A parse refuses anything else: the W3C context first and the DTG v1 context second
+(compared as exact strings — the pre-v1 `https://firstperson.network/credentials/dtg/v1`
+is not recognized), `type` holding `VerifiableCredential`, `DTGCredential` and **exactly
+one** concrete subtype, with `PersonhoodCredential` allowed only as a non-authoritative
+hint on a VMC, and a REQUIRED `issuerScope`.
+
+`EndorsementCredential`, `WitnessCredential` and `RCardCredential` are refused by name.
+The first two are now predicate profiles of the VSC; the r-card is a verifiable data
+structure, not a DTG credential.
 
 Two of those confer rather than assert, and a verifier has to be able to tell
 which it was shown:
@@ -59,19 +91,102 @@ which it was shown:
 Neither implies the other, and a VDC never supplies authority the delegator did
 not itself hold. See [Authority](#authority-vac) and [Delegation](#delegation-vdc).
 
-**_NOTE:_** The relationship card (R-Card) is **not** a `DTGCredential` subtype.
-It was reclassified as a verifiable data structure (VDS) in Working Draft 01, to
-be defined by the planned *DTG Verifiable Data Structures* specification. The
-`RCard` type, `CredentialSubjectRCard` and `new_rcard()` are deprecated in this
-library and will be removed in a future release.
+## Issuer scope
+
+Every DTG credential declares the **correlation scope** of its *issuer's* identifier in
+the REQUIRED top-level `issuerScope`: `pairwise`, `directed` or `public`, narrowest first
+and compared case-sensitively. It is the issuer's own declaration and covers nothing else
+— never the subject's scope, never the counterparty's.
+
+```Rust
+use dtg_credentials::IssuerScope;
+
+let vrc = DTGCredential::new_vrc(alice_pairwise, IssuerScope::Pairwise, bob_pairwise, now, None);
+assert!(IssuerScope::Public.satisfies(IssuerScope::Directed));
+```
+
+Every constructor takes it explicitly, except where the specification fixes it: a
+community-issued VMC is always `public` (a community that cannot be found cannot be
+joined), so `new_vmc` sets it and a grant declaring anything else is refused at parse.
+`new_community_role_vac` fixes `public` for the same reason. Profiles may set a minimum:
+`witnessed/1`, `vetted/1` and `presented/1` refuse `pairwise`.
+
+## Statements (VSC)
+
+A VSC is one signed statement, by one node about another, whose meaning is fixed by its
+`predicate` — an absolute IRI, matched byte for byte:
+
+```json
+"credentialSubject": {
+  "id": "did:example:subject",
+  "predicate": "https://registry.trustoverip.org/dtg/vsc/endorses/1",
+  "object": { "value": { "type": "SkillEndorsement", "name": "Software Development" } }
+}
+```
+
+`object` carries **exactly one** of `id`, `digestMultibase` or `value` (`StatementObject`).
+A compact form such as `dtg:endorses`, a bare term, a relative reference or an IRI not in
+Unicode NFC is refused (`check_predicate_iri`): nothing is ever expanded.
+
+| Constant | `object` | `taskContext` | min. `issuerScope` | Constructor |
+| --- | --- | --- | --- | --- |
+| `ENDORSES_V1` | `value` | optional | — | `new_endorses_vsc` |
+| `WITNESSED_V1` | `digestMultibase` | required | `directed` | `new_witnessed_vsc` |
+| `VETTED_V1` | `value` | required | `directed` | `new_vetted_vsc` |
+| `PRESENTED_V1` | `digestMultibase` | required | `directed` | `new_presented_vsc` |
+
+`new_vsc` builds a statement under any predicate — a community's own, say. The profile
+constructors additionally read the parts that must agree from the documents themselves:
+
+```Rust
+// The witness observed Alice issue her VRC, in the session she opened with it.
+let vwc = DTGCredential::new_witnessed_vsc(
+  witness_did, IssuerScope::Public,
+  &alices_vrc_json,   // subject := its issuer; object.digestMultibase := its digest
+  &session,           // taskContext := its id; taskDigestMultibase := its task digest
+  now, None, witness_context,
+)?;
+assert!(vwc.witnesses_issuance_of(&alices_vrc_json)?);   // the verifier's subject–object check
+```
+
+`new_presented_vsc` is the counterpart with the referenced credential's *subject* as the
+statement's subject (`witnesses_presentation_of` checks it). `new_vetted_vsc` takes the
+vetting payload as a `serde_json::Value`; its schema belongs to the registry definition and
+the code that fills it in.
+
+A core statement is held to its profile when parsed, built, validated and signed: a
+`witnessed/1` statement without `taskContext` and `taskDigestMultibase`, with a `value`
+object, or declaring `pairwise`, does not parse and cannot be signed.
+
+### Accepting a predicate
+
+A statement whose signature verifies is not thereby meaningful. `PredicateAcceptList` is
+the verifier's configuration, and fails closed: an exact byte match or a rejection, with no
+equivalence (`owl:sameAs` and the like) ever followed.
+
+```Rust
+// From the IRIs your governance names...
+let accepted = PredicateAcceptList::from_iris([WITNESSED_V1, "https://vtc.example/vocab#vetted"])?;
+
+// ...or from the registry's accept-list.json, keeping the statuses you admit and applying
+// each entry's constraints (object kind, taskContext, minimum issuerScope, required members).
+let accepted = PredicateAcceptList::from_registry_json(
+  &accept_list_json, &[PredicateStatus::Candidate, PredicateStatus::Standard],
+)?;
+
+let predicate = accepted.accept(&statement)?;   // Err(PredicateNotAccepted) otherwise
+```
+
+Acceptance says what a statement *means*, never more: a VSC attests and never establishes
+membership, authority or personhood.
 
 ## Trust Task Context
 
 Credentials issued inside a multi-step trust task exchange may carry a
 `taskContext` property naming that exchange: the `id` of the document that
 initiated the innermost exchange attesting what the credential states. It is
-REQUIRED on a `WitnessCredential` — deserializing a VWC without one fails with
-`DTGCredentialError::MissingTaskContext` — and OPTIONAL on every other type.
+REQUIRED on a statement whose profile requires it — `witnessed/1`, `vetted/1`,
+`presented/1` — and OPTIONAL everywhere else.
 
 An `id` is only a name, and anyone can write a different document that reuses it.
 So a citation also carries `taskDigestMultibase`, the *task digest* of the
@@ -79,28 +194,15 @@ document `taskContext` names (Trust Tasks §4.9.3): the document **with its
 top-level `proof` removed**, canonicalized with JCS, hashed with sha2-256 and
 encoded as a base58btc multibase multihash — the same encoding as every other
 digest in DTG Core Credentials, over a Trust Task document instead of a
-credential. A VWC issued through `witness/session` + `witness/session/submit`
-MUST carry it.
+credential. It is REQUIRED wherever `taskContext` is, and a statement missing it
+is refused with `MissingTaskDigest`.
 
-```Rust
-// The witness, answering witness/session/submit on Alice's session.
-let vwc = DTGCredential::new_vwc_for_session(
-  witness, alice, valid_from, valid_until,
-  &session,          // the witness/session document that opened the session
-  vrc_digest,        // digest of the edge credential Alice issued
-  witness_context,
-)?;
-
-assert_eq!(vwc.task_context(), session["id"].as_str());
-assert_eq!(vwc.task_digest_multibase(),
-           Some(dtg_credentials::task_digest_multibase_json(&session)?.as_str()));
-```
-
-`new_vwc_for_session` refuses a document that is not the opening
+The profile constructors set both from the session document, so the pair cannot
+disagree; `with_task_citation(&document)` sets both on any other credential.
+`new_witnessed_vsc` also refuses a document that is not the opening
 `witness/session` — the `submit` document, the witness's response, or anything
 whose `threadId` is not its own `id` — because naming the wrong exchange is the
-easy mistake. `with_task_citation(&document)` sets both members on any other
-credential. `new_vwc` is deprecated: it cannot set the digest.
+easy mistake.
 
 A verifier checks both halves with `cites_task`:
 
@@ -129,10 +231,11 @@ exchange completed.
 ## Digests
 
 A credential can be referenced by another through a `digestMultibase` of it: a
-member-issued VMC digests the membership grant it acknowledges, a VWC digests the
-edge credential it attests, an attenuated VAC digests the VAC it narrows, and a
-VDC digests the delegation it derives from or the grant it accepts. All five use
-the same computation.
+member-issued VMC digests the membership grant it acknowledges, a VSC's
+`object.digestMultibase` digests the credential it is about (a VWC, the edge
+credential it attests), an attenuated VAC digests the VAC it narrows, and a VDC
+digests the delegation it derives from or the grant it accepts. All of them use the
+same computation.
 
 ```Rust
 // A credential you received: digest the JSON as it arrived.
@@ -184,19 +287,19 @@ for a delegation edge.
 > so a caller migrating can recompute an old digest to compare against one they
 > stored; new code uses `digest_multibase()` / `digest_multibase_json()`.
 >
-> On the wire, `digestMultibase` is what this library emits, and the old property
-> name `digest` is still accepted when parsing. A credential carrying an old
-> *value* parses and then fails to compare, with `InvalidDigest` rather than a
-> silent mismatch.
+> On the wire, `digestMultibase` is the only name accepted; the Working Draft 01
+> name `digest` is no longer read. A `sha256:<hex>` *value* under the current name
+> parses and then fails to compare, with `InvalidDigest` rather than a silent
+> mismatch.
 
 ## Membership edges
 
 Membership is a **pair** of VMCs, not a single directed credential:
 
-| | `issuer` | `credentialSubject.id` | `digestMultibase` |
-| --- | --- | --- | --- |
-| **Community-issued** (the grant) | community | member | MUST be absent |
-| **Member-issued** (the acknowledgement) | member | community | MUST be present |
+| | `issuer` | `issuerScope` | `credentialSubject.id` | `digestMultibase` |
+| --- | --- | --- | --- | --- |
+| **Community-issued** (the grant) | community | `public`, always | member | MUST be absent |
+| **Member-issued** (the acknowledgement) | member | the member's choice | community | MUST be present |
 
 The member-issued half is the member's *consent artifact*. A community can
 always issue a credential naming somebody as a member; what it cannot do is
@@ -219,7 +322,9 @@ verify_grant_with_public_key(&grant_json, &community_public_key, Utc::now())?;
 // Then acknowledge it, as yourself. The parties are read off the grant, so the
 // two halves cannot disagree about who they are between, and a grant naming
 // anyone but `member_did` is refused.
-let mut ack = DTGCredential::new_member_vmc_for(&grant_json, &member_did, Utc::now(), valid_until)?
+let mut ack = DTGCredential::new_member_vmc_for(
+  &grant_json, &member_did, IssuerScope::Directed, Utc::now(), valid_until,
+)?
   .with_id(format!("urn:uuid:{}", Uuid::new_v4()));
 ack.sign(&member_key, None).await?;
 
@@ -241,11 +346,6 @@ the grant — and that the acknowledgement does not outlive the grant.
 before you answer: the proof, that the proof's verification method belongs to
 the grant's issuer, and that the grant is in force.
 
-> [!NOTE]
-> `new_member_vmc()` and `new_delegate_vdc()` are deprecated in favour of
-> `new_member_vmc_for()` and `new_delegate_vdc_for()`, which take the party you
-> expect the grant to name.
-
 Because the digest covers the grant's claims, a **re-issued** grant carries a
 different digest and the earlier acknowledgement no longer matches it. Renewal
 therefore forces re-acknowledgement rather than letting a stale consent carry
@@ -261,14 +361,17 @@ standing authority.
 ```Rust
 // The governing party grants Bob read+write+curate for a month.
 let root = DTGCredential::new_vac(
-  room_did, bob_did, room_did.clone(),
+  room_did, IssuerScope::Public, bob_did, room_did.clone(),
   vec!["read".into(), "write".into(), "curate".into()],
   now, now + Duration::days(30),   // validUntil is REQUIRED on a VAC
 )?;
 
-// Bob equips his agent with strictly less, bound to that agent.
+// Bob equips his agent with strictly less, bound to that agent, and forbids the
+// agent attenuating it any further.
 let agent = root.attenuate(
-  agent_did, vec!["read".into()], now, now + Duration::hours(4), Some(agent_did),
+  IssuerScope::Directed, agent_did, vec!["read".into()],
+  now, now + Duration::hours(4),
+  Some(0),                         // maxAttenuation
 )?;
 ```
 
@@ -306,12 +409,32 @@ That rule is why there is no `audience`. Equipping an agent means naming the age
 contradict it. Where a presentation may be *sent* is a different question, and it belongs
 to the trust task carrying it rather than to the credential.
 
+`authority.maxAttenuation` bounds how far a chain may extend below the VAC carrying
+it; `0` forbids attenuation outright, and absence permits it (the opposite default from
+a VDC's `maxDepth`). Set it on a root with `with_max_attenuation(n)`; `attenuate()` takes
+the child's and refuses one above what the parent permits. `verify_chain` enforces both
+the per-link rule and the per-ancestor depth, alongside the global `MAX_CHAIN_DEPTH`.
+
+### Roles are community-issued VACs
+
+A role conferred by a community — the vetter role, say — is authority, not reputation,
+so it is a VAC the community issues: `scope` the community's own DID, `actions` the
+`role:<name>` convention.
+
+```Rust
+let vetter = DTGCredential::new_community_role_vac(
+  community_did.clone(), member_did.clone(), "vetter", now, now + Duration::days(90),
+)?;   // issuerScope "public"; authority { scope: community_did, actions: ["role:vetter"] }
+
+verify_chain(&[vetter], &community_did, &community_did, "role:vetter", &member_did, now)?;
+```
+
+`actions` stays a plain string set: a member holding several roles holds several such
+VACs, or one `new_vac` listing each `role_action(name)`.
+
 > [!NOTE]
-> Two upstream changes to the VAC are **not** implemented yet: revocation via
-> `credentialStatus`, cascading to everything attenuated below
-> ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)); and a
-> `maxAttenuation` ceiling
-> ([PR #40](https://github.com/trustoverip/dtgwg-cred-spec/pull/40)).
+> Revocation via `credentialStatus` is modelled but not resolved: check it on every link
+> that carries one.
 
 ## Delegation (VDC)
 
@@ -329,7 +452,7 @@ Like membership, a delegation is a **pair**:
 ```Rust
 // Alice appoints her agent, permitting one further hop.
 let grant = DTGCredential::new_vdc(
-  alice_did, agent_did, now, now + Duration::days(90),
+  alice_did, IssuerScope::Directed, agent_did, now, now + Duration::days(90),
   vec!["schedule:read".into(), "schedule:propose".into()],
   Some(1),                          // maxDepth; None or 0 prohibits re-delegation
 )?;
@@ -337,7 +460,9 @@ let grant = DTGCredential::new_vdc(
 // The agent verifies the grant, then accepts it as itself. `grant_json` is the
 // wire form, not a parse of it.
 verify_grant_with_public_key(&grant_json, &alice_public_key, now)?;
-let acceptance = DTGCredential::new_delegate_vdc_for(&grant_json, &agent_did, now, valid_until)?;
+let acceptance = DTGCredential::new_delegate_vdc_for(
+  &grant_json, &agent_did, IssuerScope::Directed, now, valid_until,
+)?;
 assert!(acceptance.accepts(&grant)?);
 ```
 
@@ -352,7 +477,7 @@ may do that; a delegate needing a further delegate ordinarily asks for a fresh r
 delegation rather than minting one.
 
 ```Rust
-let sub = grant.redelegate(subagent_did, vec!["schedule:read".into()], now, until)?;
+let sub = grant.redelegate(IssuerScope::Directed, subagent_did, vec!["schedule:read".into()], now, until)?;
 
 let appointed = delegation::verify_chain(&[sub, grant], alice_did, "schedule:read", Utc::now())?;
 assert_eq!(appointed.principal, alice_did);   // the acts are attributed to Alice
@@ -424,6 +549,7 @@ worth stating for each breaking release:
 | 0.9.1 | `delegation::verify_chain` requires the leaf to appoint `presenter` | Verifiers first |
 | 0.10.0 (first published in 0.11.0) | Validity-window and JSON-depth checks at issue and verify; `DTGCredentialError` is `#[non_exhaustive]` | Verifiers first |
 | 0.11.0 | `taskDigestMultibase` added; `DTGCommon` gains a field; `new_vwc` deprecated | Any order |
+| 0.12.0 | v1 context IRI; `issuerScope` REQUIRED; `StatementCredential` replaces VEC/VWC; `maxAttenuation` | **Both at once** — see below |
 
 Every one through 0.10.0 is *verifiers first*, and for the same reason: each made a
 verifier stricter or changed what it reads, so a verifier that moves first accepts
@@ -432,6 +558,15 @@ an older release carries `taskDigestMultibase` through a round trip in `DTGCommo
 and nothing changes on the wire for a credential without it. 0.10.0 was never published
 to crates.io, so a consumer on 0.9.x takes 0.10.0 and 0.11.0 together, and verifiers
 first still applies.
+
+**0.12.0 cannot be ordered.** It is the first release on the specification's frozen v1
+context, and the change is a clean break by design: a 0.12 verifier refuses every
+credential a 0.11 issuer emits (pre-v1 context, no `issuerScope`, retired types), and a
+0.11 verifier refuses every credential a 0.12 issuer emits (unknown context, unknown
+`StatementCredential`). Credentials issued before the Implementers Draft are not
+conformant, so there is no compatibility mode to stage through. Upgrade the issuers and
+verifiers of one deployment together, and re-issue the credentials they hold: grants,
+acknowledgements, VACs and VDCs alike, since every digest changes with the new members.
 
 `0.8.0` and `0.9.1` are API breaks rather than wire changes — no credential changes
 shape — but they land in the same place: a caller that upgrades gets a compile error
@@ -463,7 +598,7 @@ of that type.
 Example:
 
 ```Rust
-let vpc = DTGCredential::new_vpc(issuer, subject, valid_from, valid_to);
+let vpc = DTGCredential::new_vpc(issuer, IssuerScope::Directed, subject, valid_from, valid_to);
 ```
 
 The created `DTGCredential` can be serialized to JSON using `serde_json` allowing
@@ -507,7 +642,7 @@ selects one nor resolves it. `BitstringStatusListEntry` is the common choice.
 The `new_*()` constructors leave it unset. Chain `with_credential_status()`:
 
 ```Rust
-let vdc = DTGCredential::new_vdc(delegator, delegate, valid_from, valid_to, scope, None)?
+let vdc = DTGCredential::new_vdc(delegator, IssuerScope::Directed, delegate, valid_from, valid_to, scope, None)?
   .with_credential_status(json!({
       "id": "https://example.com/status/3#94567",
       "type": "BitstringStatusListEntry",
@@ -546,9 +681,9 @@ By default the `affinidi-signing` feature is enabled which allows you to sign a
 credential
 
 ```Rust
-let mut vpc = DTGCredential::new_vpc(issuer, subject, valid_from, valid_to);
+let mut vpc = DTGCredential::new_vpc(issuer, IssuerScope::Directed, subject, valid_from, valid_to);
 
-vpc.sign(&signing_key).await?;
+vpc.sign(&signing_key, None).await?;
 ```
 
 ### Verifying credentials
@@ -560,11 +695,11 @@ key, then you can directly verify the credential:
 
 ```Rust
 let signing_key = Secret::generate_ed25519(None, None);
-let mut vpc = DTGCredential::new_vpc(issuer, subject, valid_from, valid_to);
+let mut vpc = DTGCredential::new_vpc(issuer, IssuerScope::Directed, subject, valid_from, valid_to);
 
-vpc.sign(&signing_key).await?;
+vpc.sign(&signing_key, None).await?;
 
-vpc.verify(&signing_key.get_public_bytes())?;
+vpc.verify_proof_with_public_key(signing_key.get_public_bytes())?;
 ```
 
 **Method 2:** If you do not have the public key material, you are likely going to
@@ -595,7 +730,7 @@ tdk.verify_data(&unsigned, None, &proof).await?;
 You can deal with the raw credential as required.
 
 ```Rust
-let vrc = DTGCredential::new_vrc(issuer, subject, valid_from, valid_to);
+let vrc = DTGCredential::new_vrc(issuer, IssuerScope::Pairwise, subject, valid_from, valid_to);
 
 let credential = vrc.credential();
 ```
@@ -603,9 +738,9 @@ let credential = vrc.credential();
 You can determine the credential type easily using:
 
 ```Rust
-let vmc = DTGCredential::new_vmc(issuer, subject, valid_from, valid_to);
+let vmc = DTGCredential::new_vmc(issuer, subject, valid_from, valid_to, false);
 
-if let DTGCredentialType::VMC = vmc.type_() {
+if vmc.type_() == DTGCredentialType::Membership {
   // Good
 }
 ```
@@ -613,7 +748,7 @@ if let DTGCredentialType::VMC = vmc.type_() {
 Has this Credential been signed?
 
 ```Rust
-let vmc = DTGCredential::new_vmc(issuer, subject, valid_from, valid_to);
+let vmc = DTGCredential::new_vmc(issuer, subject, valid_from, valid_to, false);
 
 if vmc.signed() {
   println!("Credential has been signed");

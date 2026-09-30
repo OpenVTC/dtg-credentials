@@ -21,6 +21,8 @@
 //! | Each link's issuer must be its parent's subject | grafting someone else's grant onto your own |
 //! | The leaf's subject must be the presenter | a captured presentation replayed by whoever caught it |
 //! | Depth is bounded | a denial-of-service against the verifier, which walks every link |
+//! | No link lies further below an ancestor than its `maxAttenuation` permits | a governing party's "decide this personally" overridden by a holder |
+//! | No link raises the `maxAttenuation` it inherits | the same, one link at a time |
 //! | Every link must carry `validUntil` | authority nobody can withdraw by waiting |
 //!
 //! # Bearer-side resolution
@@ -64,14 +66,18 @@
 //! attenuation, whose whole purpose is that the party who attenuated is not in the loop
 //! when its agent acts.
 //!
-//! # Still ahead of this module
+//! # `maxAttenuation` and the global ceiling are both enforced
 //!
-//! Two changes to the VAC are in flight upstream and are **not** implemented here:
-//! revocation via `credentialStatus`, cascading to everything attenuated below
-//! ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)); and a
-//! `maxAttenuation` ceiling bounding depth per-ancestor rather than only globally
-//! ([PR #40](https://github.com/trustoverip/dtgwg-cred-spec/pull/40)). Until they land, a
-//! caller wanting revocation must check [`crate::DTGCommon::credential_status`] itself.
+//! [MAX_CHAIN_DEPTH] is a resource bound every verifier applies; `authority.maxAttenuation`
+//! is a policy an issuer sets for its own grant. A chain MUST satisfy both: a chain of five
+//! under a root bearing `maxAttenuation` `2` is within the ceiling and still invalid.
+//!
+//! # Not checked here: revocation
+//!
+//! A VAC carrying `credentialStatus` MUST be checked against it, and revoking one withdraws
+//! everything attenuated below it. Status is a live lookup against a mechanism the governing
+//! party chooses, so this module does not perform it: check
+//! [`crate::DTGCommon::credential_status`] on every link that carries one.
 
 use chrono::{DateTime, Utc};
 
@@ -243,6 +249,34 @@ pub enum AuthorityError {
         /// Position in the chain, leaf first.
         index: usize,
     },
+
+    /// A link lies further below an ancestor than that ancestor's `maxAttenuation` permits.
+    #[error(
+        "chain link {index} lies {depth} below link {ancestor}, whose maxAttenuation is {max_attenuation}"
+    )]
+    ExceedsMaxAttenuation {
+        /// The link too far down — always the leaf, which is furthest from every ancestor.
+        index: usize,
+        /// The ancestor whose limit it breaks.
+        ancestor: usize,
+        /// How many steps below that ancestor it lies.
+        depth: usize,
+        /// The ancestor's `maxAttenuation`.
+        max_attenuation: u32,
+    },
+
+    /// A link bears a `maxAttenuation` above one less than its parent's.
+    #[error(
+        "chain link {index} bears maxAttenuation {found}, above the {allowed} its parent permits"
+    )]
+    RaisesMaxAttenuation {
+        /// Position in the chain, leaf first.
+        index: usize,
+        /// What the link bears.
+        found: u32,
+        /// The most the parent permits.
+        allowed: u32,
+    },
 }
 
 /// What a verified chain permits.
@@ -409,6 +443,19 @@ pub fn verify_chain(
                 });
             }
         }
+        // `maxAttenuation` never rises: a link under a parent bearing `n` may bear at most
+        // `n - 1`. A link bearing none is not a raise — it does not bear one — and how far
+        // below the parent it may lie is the per-ancestor depth rule's to answer, below.
+        if let (Some(parent_max), Some(max)) = (parent_grant.max_attenuation, grant.max_attenuation)
+            && (parent_max == 0 || max > parent_max - 1)
+        {
+            return Err(AuthorityError::RaisesMaxAttenuation {
+                index,
+                found: max,
+                allowed: parent_max.saturating_sub(1),
+            });
+        }
+
         // Both are present: the loop above rejected any link without one.
         if let (Some(until), Some(parent_until)) = (
             link.credential().valid_until(),
@@ -419,6 +466,24 @@ pub fn verify_chain(
                 index,
                 until,
                 parent_until,
+            });
+        }
+    }
+
+    // Depth below every ancestor. The leaf is furthest from each, `ancestor` steps below
+    // the link at that index, so checking it checks every link between. This is what bounds
+    // a chain whose intermediate links bear no `maxAttenuation` of their own, which the
+    // per-link rule above cannot see.
+    for (ancestor, link) in chain.iter().enumerate().skip(1) {
+        let grant = link.credential().authority().expect("checked above");
+        if let Some(max_attenuation) = grant.max_attenuation
+            && ancestor > max_attenuation as usize
+        {
+            return Err(AuthorityError::ExceedsMaxAttenuation {
+                index: 0,
+                ancestor,
+                depth: ancestor,
+                max_attenuation,
             });
         }
     }
