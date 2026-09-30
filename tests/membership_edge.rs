@@ -11,7 +11,7 @@
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use dtg_credentials::{
-    DTGCredential, DTGCredentialError, DTGCredentialType, digest_multibase_json,
+    DTGCredential, DTGCredentialError, DTGCredentialType, IssuerScope, digest_multibase_json,
 };
 use serde_json::{Value, json};
 
@@ -43,10 +43,11 @@ fn forged_grant(community: &str, member: &str) -> Value {
     json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
-            "https://firstperson.network/credentials/dtg/v1"
+            "https://registry.trustoverip.org/dtg/context/v1"
         ],
         "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
         "issuer": community,
+        "issuerScope": "public",
         "validFrom": "2026-01-06T10:00:00Z",
         "credentialSubject": { "id": member }
     })
@@ -58,7 +59,8 @@ fn forged_grant(community: &str, member: &str) -> Value {
 fn an_acknowledgement_is_built_for_the_member_the_grant_names() {
     let grant = unsigned_grant(COMMUNITY, MEMBER, None);
 
-    let ack = DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), None).expect("builds");
+    let ack = DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Directed, t(1), None)
+        .expect("builds");
 
     assert_eq!(ack.type_(), DTGCredentialType::Membership);
     assert_eq!(ack.issuer(), MEMBER, "the member is read off the grant");
@@ -78,7 +80,8 @@ fn an_acknowledgement_is_built_for_the_member_the_grant_names() {
 fn a_grant_naming_someone_else_is_refused() {
     let grant = unsigned_grant(COMMUNITY, SOMEONE_ELSE, None);
 
-    let err = DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), None).unwrap_err();
+    let err = DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Directed, t(1), None)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -90,7 +93,8 @@ fn a_grant_naming_someone_else_is_refused() {
 
     // Compared exactly: an identifier that merely begins the same way is someone else.
     let grant = unsigned_grant(COMMUNITY, "did:example:member-2", None);
-    let err = DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), None).unwrap_err();
+    let err = DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Directed, t(1), None)
+        .unwrap_err();
     assert!(
         matches!(err, DTGCredentialError::NotTheGrantSubject { .. }),
         "got {err:?}"
@@ -103,8 +107,14 @@ fn a_grant_naming_someone_else_is_refused() {
 fn an_acknowledgement_may_not_outlive_its_grant() {
     let grant = unsigned_grant(COMMUNITY, MEMBER, Some(t(24 * 30)));
 
-    let err =
-        DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), Some(t(24 * 31))).unwrap_err();
+    let err = DTGCredential::new_member_vmc_for(
+        &grant,
+        MEMBER,
+        IssuerScope::Directed,
+        t(1),
+        Some(t(24 * 31)),
+    )
+    .unwrap_err();
     assert!(
         matches!(
             err,
@@ -115,7 +125,8 @@ fn an_acknowledgement_may_not_outlive_its_grant() {
     );
 
     // Open-ended, against a grant that expires, outlives it too.
-    let err = DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), None).unwrap_err();
+    let err = DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Directed, t(1), None)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -127,9 +138,15 @@ fn an_acknowledgement_may_not_outlive_its_grant() {
         "got {err:?}"
     );
 
-    DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), Some(t(24 * 30)))
-        .expect("ending with the grant is within it");
-    DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), Some(t(24)))
+    DTGCredential::new_member_vmc_for(
+        &grant,
+        MEMBER,
+        IssuerScope::Directed,
+        t(1),
+        Some(t(24 * 30)),
+    )
+    .expect("ending with the grant is within it");
+    DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Directed, t(1), Some(t(24)))
         .expect("ending before the grant is within it");
 }
 
@@ -138,7 +155,8 @@ fn an_acknowledgement_may_not_outlive_its_grant() {
 fn a_grant_without_an_expiry_bounds_nothing() {
     let grant = unsigned_grant(COMMUNITY, MEMBER, None);
 
-    DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), None).expect("open-ended");
+    DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Directed, t(1), None)
+        .expect("open-ended");
 }
 
 /// An expiry that cannot be read is not the same as no expiry, so it is refused rather than
@@ -148,7 +166,9 @@ fn a_grant_with_an_unreadable_expiry_is_refused() {
     let mut grant = unsigned_grant(COMMUNITY, MEMBER, None);
     grant["validUntil"] = json!("next year");
 
-    let err = DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), Some(t(24))).unwrap_err();
+    let err =
+        DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Directed, t(1), Some(t(24)))
+            .unwrap_err();
     assert!(
         matches!(err, DTGCredentialError::NotAMembershipGrant(_)),
         "got {err:?}"
@@ -160,7 +180,14 @@ fn an_inverted_window_is_refused() {
     let grant = unsigned_grant(COMMUNITY, MEMBER, None);
 
     for (from, until) in [(t(24), t(1)), (t(1), t(1))] {
-        let err = DTGCredential::new_member_vmc_for(&grant, MEMBER, from, Some(until)).unwrap_err();
+        let err = DTGCredential::new_member_vmc_for(
+            &grant,
+            MEMBER,
+            IssuerScope::Directed,
+            from,
+            Some(until),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, DTGCredentialError::InvalidValidityWindow { .. }),
             "got {err:?}"
@@ -175,7 +202,8 @@ fn an_inverted_window_is_refused() {
 fn binding_does_not_establish_that_the_grant_was_signed() {
     let grant = unsigned_grant(COMMUNITY, MEMBER, None);
 
-    let ack = DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), None).expect("builds");
+    let ack = DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Directed, t(1), None)
+        .expect("builds");
     let grant: DTGCredential = serde_json::from_value(grant).unwrap();
 
     assert!(!grant.signed());
@@ -195,8 +223,9 @@ fn binding_does_not_establish_that_the_grant_was_signed() {
 fn a_grant_its_own_subject_wrote_satisfies_the_member_check() {
     let forged = forged_grant(COMMUNITY, ATTACKER);
 
-    let ack = DTGCredential::new_member_vmc_for(&forged, ATTACKER, t(1), None)
-        .expect("the expected member and the grant's subject are the same identifier");
+    let ack =
+        DTGCredential::new_member_vmc_for(&forged, ATTACKER, IssuerScope::Directed, t(1), None)
+            .expect("the expected member and the grant's subject are the same identifier");
     assert_eq!(ack.issuer(), ATTACKER);
     assert_eq!(ack.subject(), COMMUNITY);
     assert_eq!(
@@ -212,20 +241,27 @@ fn a_grant_its_own_subject_wrote_satisfies_the_member_check() {
     );
 }
 
-/// The deprecated constructor keeps its behaviour for existing callers: the member is taken
-/// from the grant without comparison, and the grant's expiry is not consulted. Its own window
-/// is checked, as every constructor's is.
+/// A community-issued grant is `public`, so a grant declaring anything else is not one to
+/// acknowledge — and the acknowledgement declares the member's own scope, not the grant's.
 #[test]
-#[allow(deprecated)]
-fn the_deprecated_constructor_checks_neither_the_member_nor_the_grant_expiry() {
-    let grant = unsigned_grant(COMMUNITY, SOMEONE_ELSE, Some(t(24)));
+fn the_grant_must_be_public_and_the_acknowledgement_declares_the_members_scope() {
+    let grant = unsigned_grant(COMMUNITY, MEMBER, None);
+    let ack = DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Pairwise, t(1), None)
+        .expect("builds");
+    assert_eq!(ack.issuer_scope(), IssuerScope::Pairwise);
 
-    let ack = DTGCredential::new_member_vmc(&grant, t(1), None).expect("builds");
-    assert_eq!(ack.issuer(), SOMEONE_ELSE);
-
+    let mut directed = grant.clone();
+    directed["issuerScope"] = json!("directed");
     assert!(matches!(
-        DTGCredential::new_member_vmc(&grant, t(2), Some(t(1))),
-        Err(DTGCredentialError::InvalidValidityWindow { .. })
+        DTGCredential::new_member_vmc_for(&directed, MEMBER, IssuerScope::Directed, t(1), None),
+        Err(DTGCredentialError::NotAMembershipGrant(_))
+    ));
+
+    let mut undeclared = grant;
+    undeclared.as_object_mut().unwrap().remove("issuerScope");
+    assert!(matches!(
+        DTGCredential::new_member_vmc_for(&undeclared, MEMBER, IssuerScope::Directed, t(1), None),
+        Err(DTGCredentialError::NotAMembershipGrant(_))
     ));
 }
 
@@ -271,8 +307,14 @@ mod verifying_the_grant {
         verify_grant_with_public_key(&grant, key.get_public_bytes(), t(1))
             .expect("signed by its issuer, and in force");
 
-        let ack = DTGCredential::new_member_vmc_for(&grant, MEMBER, t(1), Some(t(24 * 30)))
-            .expect("builds");
+        let ack = DTGCredential::new_member_vmc_for(
+            &grant,
+            MEMBER,
+            IssuerScope::Directed,
+            t(1),
+            Some(t(24 * 30)),
+        )
+        .expect("builds");
         let grant: DTGCredential = serde_json::from_value(grant).unwrap();
         assert!(ack.acknowledges(&grant).unwrap());
     }

@@ -7,6 +7,155 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Conformance to the current DTG Core Credentials draft (Working Draft 0.6.0) and its frozen
+v1 context.** Every credential this release emits differs on the wire from what 0.11 emitted,
+and every credential 0.11 emitted is refused here. See *Upgrading from 0.11* below before
+bumping.
+
+> [!IMPORTANT]
+> **Wire break with no upgrade ordering.** A 0.12 verifier refuses 0.11 credentials (old
+> context, no `issuerScope`, retired types) and a 0.11 verifier refuses 0.12 credentials
+> (unknown context and type). The specification makes credentials issued before its
+> Implementers Draft non-conformant, so there is no legacy alias to stage through: upgrade
+> a deployment's issuers and verifiers together and re-issue what they hold. Every digest
+> changes, so acknowledgements, attenuations and acceptances are re-derived too.
+
+### Changed — the v1 context
+
+- `@context` is `["https://www.w3.org/ns/credentials/v2",
+  "https://registry.trustoverip.org/dtg/context/v1", …]`, exported as `W3C_VC_V2_CONTEXT`
+  and `DTG_CONTEXT_V1`. `https://firstperson.network/credentials/dtg/v1` is gone and is not
+  accepted as an alias.
+- A parse now requires the W3C context **first** (v2, or v1.1 under the legacy profile) and
+  `DTG_CONTEXT_V1` **second**, compared as exact strings; further contexts may follow.
+  Otherwise `DTGCredentialError::InvalidContext` (or `UnknownVCVersion` for a missing W3C
+  context).
+- `type` must hold `VerifiableCredential`, `DTGCredential` and **exactly one** concrete
+  subtype; `PersonhoodCredential` is accepted only on a `MembershipCredential`, as the
+  non-authoritative hint the spec permits. Any other string — a second subtype, a
+  duplicate, an undefined or retired type — is `DTGCredentialError::InvalidType`.
+  `@context` and `type` are checked before the subject, so a retired type is reported by
+  name rather than as an unmatched subject shape.
+- The Working Draft 01 wire name `digest` for a VMC's `digestMultibase` is no longer
+  accepted.
+
+### Added — `issuerScope`
+
+- `IssuerScope { Pairwise, Directed, Public }`: serialized exactly lowercase, parsed
+  case-sensitively (`FromStr`), ordered narrowest first, with `satisfies(minimum)`.
+- `DTGCommon::issuer_scope` is a REQUIRED top-level member. A credential without it, or with
+  any other value, does not parse. Accessors on `DTGCommon` and `DTGCredential`.
+- Every constructor takes it, except where the specification fixes it: `new_vmc` always
+  declares `public` (a community-issued grant can declare nothing else, and one that does is
+  refused at parse and by `validate()` with `IssuerScopeTooNarrow`), and
+  `new_community_role_vac` likewise. `new_member_vmc_for` refuses a grant not declaring
+  `public` with `NotAMembershipGrant`.
+
+### Added — `StatementCredential` (VSC)
+
+- `DTGCredentialType::Statement`, `CredentialSubject::Statement(CredentialSubjectStatement {
+  id, predicate, object, witness_context, extra })`, and `StatementObject { Id,
+  DigestMultibase, Value }` — exactly one member, refused otherwise. Unmodelled subject
+  members are kept in `extra`, because a verifier MUST ignore members a profile does not
+  define and a digest must survive the round trip.
+- `check_predicate_iri`: a predicate is an absolute IRI in NFC, compared byte for byte.
+  CURIEs (`dtg:witnessed`), bare terms, relative references, whitespace and non-NFC
+  spellings are `InvalidPredicate`. New dependency: `unicode-normalization`.
+- Predicate constants `ENDORSES_V1`, `WITNESSED_V1`, `VETTED_V1`, `PRESENTED_V1`, and
+  `PredicateProfile::core(iri)` with each profile's object kinds, `taskContext` requirement
+  and minimum `issuerScope`. A statement under a core predicate is held to its profile at
+  parse, in `validate()` and so in `sign()`: `MissingTaskContext`, `MissingTaskDigest`,
+  `IssuerScopeTooNarrow`, `ProfileViolation`.
+- Constructors: `new_vsc` (any predicate), `new_endorses_vsc`, `new_witnessed_vsc`,
+  `new_vetted_vsc`, `new_presented_vsc`. The witnessed and presented constructors take the
+  referenced credential in its wire form and read the subject from it — its `issuer`, or its
+  `credentialSubject.id` — so the profile's subject–object rule holds by construction.
+  `new_witnessed_vsc` carries over `new_vwc_for_session`'s checks on the `witness/session`
+  document.
+- Verifier checks for the subject–object rules: `witnesses_issuance_of(&credential)` and
+  `witnesses_presentation_of(&credential)`.
+- `DTGCredential::statement()` / `predicate()`, `DTGCommon::statement()` / `statement_mut()`.
+
+### Added — predicate acceptance
+
+- `PredicateAcceptList`, failing closed: `from_iris([...])`, or
+  `from_registry_json(accept_list_json, &[PredicateStatus::…])` over the registry's
+  `accept-list.json` (types `RegistryAcceptList`, `AcceptListEntry`, `AdditionalMember`,
+  `PredicateStatus`). `accept(&vsc)` validates the statement, matches its predicate exactly
+  — no equivalence is followed — and applies the entry's constraints (object kind,
+  `taskContext`, minimum `issuerScope`, required members). An unknown member of a
+  predicate entry is refused rather than ignored, since it may be a constraint this
+  version cannot apply; unknown build metadata on the envelope is ignored. The envelope
+  carries `commit`, which is what a verifier pins (the registry does not tag releases).
+
+### Added — VAC `maxAttenuation` and role VACs
+
+- `AuthorityGrant::max_attenuation` (`authority.maxAttenuation`). `with_max_attenuation(n)`
+  sets it on a root; `attenuate` / `attenuate_from_json` take the child's, refuse a child of
+  a `0` parent or one above `n - 1`, and default to `n - 1` under a bounded parent.
+  `authority::verify_chain` enforces both the per-link rule
+  (`AuthorityError::RaisesMaxAttenuation`) and the per-ancestor depth
+  (`AuthorityError::ExceedsMaxAttenuation`). Before this, a spec-conformant VAC carrying
+  `maxAttenuation` did not parse at all.
+- `new_community_role_vac(community, member, role, from, until)`: a `public` VAC with
+  `scope` the community DID and `actions` `["role:<role>"]`, the replacement for role
+  endorsements. `create::role_action` and `create::ROLE_ACTION_PREFIX` spell the action.
+
+### Removed
+
+- `EndorsementCredential`, `WitnessCredential` and `RCardCredential`:
+  `DTGCredentialType::{Endorsement, Witness, RCard}`, `CredentialSubject::{Endorsement,
+  Witness, RCard}`, `CredentialSubjectEndorsement`, `CredentialSubjectWitness`,
+  `CredentialSubjectRCard`, and `new_vec`, `new_vwc`, `new_vwc_for_session`, `new_rcard`.
+  Credentials of those types are refused at parse. `WitnessContext` stays, as the
+  `witnessed/1` subject member.
+- `new_member_vmc` and `new_delegate_vdc`, deprecated since 0.10.0.
+- `impl Default for DTGCommon`: a default would have to invent an `issuerScope`. Build
+  credentials with the `new_*` constructors.
+
+### Changed — also breaking
+
+- New parameters: `issuer_scope` after the issuer on `new_vrc`, `new_vic`, `new_vpc`,
+  `new_vac`, `new_vdc`; after the party on `new_member_vmc_for` and `new_delegate_vdc_for`;
+  first on `attenuate`, `redelegate`, and after the parent on `attenuate_from_json`,
+  `redelegate_from_json`. `attenuate` and `attenuate_from_json` also take a trailing
+  `max_attenuation: Option<u32>`.
+- `AuthorityGrant` gains a field, so an exhaustive struct literal needs `max_attenuation`.
+  `AuthorityError` gains two variants.
+- `DTGCredentialError` gains `MissingTaskDigest`, `InvalidContext`, `InvalidType`,
+  `IssuerScopeTooNarrow`, `InvalidPredicate`, `ProfileViolation`, `PredicateNotAccepted`
+  and `MalformedAcceptList`; `MissingTaskContext` now means a statement profile's
+  requirement.
+- A malformed document fails deserialization as `MalformedCredential` wrapping the serde
+  error, where it previously surfaced serde's error directly.
+- `validate()` (and so `sign()` and `verify_proof_with_public_key()`) re-runs the parse
+  checks over the model, so a credential mutated out of shape through `credential_mut()` is
+  refused before it is signed.
+- `WitnessContext` omits unset members instead of serializing them as `null`.
+
+### Upgrading from 0.11
+
+| 0.11 | 0.12 |
+| --- | --- |
+| `new_vrc(i, s, from, until)` | `new_vrc(i, IssuerScope::Pairwise, s, from, until)` (and `new_vic`, `new_vpc` likewise) |
+| `new_vmc(c, m, from, until, phc)` | unchanged — declares `public` |
+| `new_member_vmc_for(&g, m, from, until)` | `new_member_vmc_for(&g, m, scope, from, until)` |
+| `new_vac(i, s, scope, actions, from, until)` | `new_vac(i, IssuerScope::Public, s, scope, actions, from, until)` |
+| `vac.attenuate(s, actions, from, until)` | `vac.attenuate(scope, s, actions, from, until, None)` |
+| `new_vdc(i, s, from, until, scope, depth)` | `new_vdc(i, IssuerScope::Directed, s, from, until, scope, depth)` |
+| `new_delegate_vdc_for(&g, d, from, until)` | `new_delegate_vdc_for(&g, d, scope, from, until)` |
+| `vdc.redelegate(s, scope, from, until)` | `vdc.redelegate(issuer_scope, s, scope, from, until)` |
+| `new_vec(i, s, from, until, v)` | `new_endorses_vsc(i, scope, s, v, from, until)?` |
+| a role `EndorsementCredential` | `new_community_role_vac(community, member, "vetter", from, until)?` |
+| a vetting `EndorsementCredential` | `new_vetted_vsc(i, IssuerScope::Directed, s, payload, &session, from, until)?` |
+| `new_vwc_for_session(i, s, from, until, &session, digest, ctx)` | `new_witnessed_vsc(i, scope, &edge_credential_json, &session, from, until, ctx)?` — the subject and digest are read from the edge credential |
+| `DTGCredentialType::Endorsement` / `Witness` | `DTGCredentialType::Statement`, then `predicate()` against `ENDORSES_V1` / `WITNESSED_V1` |
+| matching `"WitnessCredential"` in `type` | match `credentialSubject.predicate == WITNESSED_V1`, and accept it through a `PredicateAcceptList` |
+| `"https://firstperson.network/credentials/dtg/v1"` | `dtg_credentials::DTG_CONTEXT_V1` |
+
+Anything that builds DTG credential JSON by hand needs `issuerScope` and the new context too,
+or this release refuses it.
+
 ## [0.11.0] - 2026-09-22
 
 **The first published release since 0.9.1.** 0.10.0 was never published to crates.io, so

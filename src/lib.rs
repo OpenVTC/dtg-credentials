@@ -12,11 +12,113 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt::Display;
+use std::str::FromStr;
 use thiserror::Error;
 
+pub mod accept;
 pub mod authority;
 pub mod create;
 pub mod delegation;
+pub mod statement;
+
+pub use accept::{
+    AcceptListEntry, AdditionalMember, PredicateAcceptList, PredicateStatus, RegistryAcceptList,
+};
+pub use statement::{
+    CredentialSubjectStatement, ENDORSES_V1, ObjectKind, PRESENTED_V1, PredicateProfile,
+    StatementObject, VETTED_V1, WITNESSED_V1, check_predicate_iri,
+};
+
+/// The W3C VC Data Model 2.0 context, which a DTG credential lists **first**.
+pub const W3C_VC_V2_CONTEXT: &str = "https://www.w3.org/ns/credentials/v2";
+
+/// The W3C VC Data Model 1.1 context, accepted in first position under DTG Core Credentials
+/// §Legacy System Compatibility. This library never emits it.
+pub const W3C_VC_V1_CONTEXT: &str = "https://www.w3.org/2018/credentials/v1";
+
+/// The frozen DTG credential context, version 1, which a DTG credential lists **second**.
+///
+/// Published by the DTG VSC Predicate Registry as one byte-frozen document, and compared as
+/// an exact string: scheme `https`, host `registry.trustoverip.org` with no `www.`, no
+/// trailing slash. Every term this library emits is defined either here or in
+/// [W3C_VC_V2_CONTEXT].
+///
+/// # No other DTG context is recognized
+///
+/// Credentials issued before the Implementers Draft of DTG Core Credentials are not
+/// conformant to it, whatever context they list, and contexts published before `v1` under
+/// other IRIs — `https://firstperson.network/credentials/dtg/v1` among them — are not
+/// recognized. A credential listing one is refused at parse rather than aliased.
+pub const DTG_CONTEXT_V1: &str = "https://registry.trustoverip.org/dtg/context/v1";
+
+/// The correlation scope an issuer declares for its own identifier, carried as the
+/// REQUIRED top-level `issuerScope` of every DTG credential (DTG Core Credentials
+/// §Correlation Scope).
+///
+/// # Ordered, narrowest first
+///
+/// `pairwise < directed < public`, and the derived [Ord] follows it. Where a profile or a
+/// credential type states a minimum, a declaration narrower than that minimum does not
+/// satisfy it: see [IssuerScope::satisfies].
+///
+/// # A declaration about the issuer only
+///
+/// A credential declares the scope of the identifier in `issuer` and of nothing else — not
+/// its subject's, not its counterparty's. A verifier that needs the counterparty's scope
+/// reads it from a credential the counterparty issued.
+///
+/// Serialized exactly as `pairwise`, `directed` or `public`, and parsed case-sensitively:
+/// `"Public"` is not a declaration, and a credential carrying it is refused.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum IssuerScope {
+    /// Known to exactly one counterparty; correlation confined to this one relationship.
+    Pairwise,
+
+    /// Known to a set of counterparties the holder chooses, and no further.
+    Directed,
+
+    /// Unbounded; ordinarily published so that it can be found.
+    Public,
+}
+
+impl IssuerScope {
+    /// The wire value: `pairwise`, `directed` or `public`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IssuerScope::Pairwise => "pairwise",
+            IssuerScope::Directed => "directed",
+            IssuerScope::Public => "public",
+        }
+    }
+
+    /// Does this declaration meet `minimum`? True when it is at least as wide.
+    pub fn satisfies(&self, minimum: IssuerScope) -> bool {
+        *self >= minimum
+    }
+}
+
+impl Display for IssuerScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IssuerScope {
+    type Err = DTGCredentialError;
+
+    /// Parses the wire value, case-sensitively.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pairwise" => Ok(IssuerScope::Pairwise),
+            "directed" => Ok(IssuerScope::Directed),
+            "public" => Ok(IssuerScope::Public),
+            other => Err(DTGCredentialError::MalformedCredential(format!(
+                "`{other}` is not an issuerScope; expected `pairwise`, `directed` or `public`"
+            ))),
+        }
+    }
+}
 
 /// What W3C VC Format is the credential using?
 #[derive(Clone, Copy, Debug)]
@@ -116,16 +218,66 @@ pub enum DTGCredentialError {
     #[error("attenuation would widen the parent grant: {0}")]
     AttenuationWidens(String),
 
-    /// A WitnessCredential (VWC) was missing the REQUIRED `taskContext` property
-    #[error("WitnessCredential is missing the required taskContext property")]
+    /// A StatementCredential under a profile that REQUIRES `taskContext` — `witnessed/1`,
+    /// `vetted/1`, `presented/1`, or an accept-list entry saying so — carries none.
+    #[error("the statement's predicate profile requires taskContext, and it has none")]
     MissingTaskContext,
+
+    /// A credential that REQUIRES `taskContext` carries it without `taskDigestMultibase`,
+    /// which DTG Core Credentials makes REQUIRED wherever `taskContext` is.
+    #[error("taskContext is required here, and so is taskDigestMultibase, which is absent")]
+    MissingTaskDigest,
+
+    /// `@context` does not list the W3C VC context first and [DTG_CONTEXT_V1] second.
+    #[error("malformed @context: {0}")]
+    InvalidContext(String),
+
+    /// `type` is not `VerifiableCredential`, `DTGCredential` and exactly one concrete
+    /// subtype (with `PersonhoodCredential` permitted as a hint on a VMC only), or names a
+    /// subtype this specification has retired.
+    #[error("malformed type: {0}")]
+    InvalidType(String),
+
+    /// `issuerScope` is narrower than the credential type or predicate profile permits.
+    ///
+    /// A community-issued VMC can only truthfully declare `public`; `witnessed/1`,
+    /// `vetted/1` and `presented/1` require `directed` at minimum.
+    #[error("issuerScope `{declared}` is narrower than the required minimum `{minimum}`")]
+    IssuerScopeTooNarrow {
+        declared: IssuerScope,
+        minimum: IssuerScope,
+    },
+
+    /// A VSC `predicate` is not an absolute IRI in Unicode Normalization Form C.
+    ///
+    /// A compact form (a CURIE such as `dtg:witnessed`, or a bare JSON-LD term) is
+    /// malformed rather than unknown: no expansion is ever performed.
+    #[error("invalid predicate: {0}")]
+    InvalidPredicate(String),
+
+    /// A VSC does not meet a constraint of its predicate's profile: an `object` kind the
+    /// profile does not permit, a REQUIRED member missing, or a subject–object relationship
+    /// that does not hold.
+    #[error("the statement does not meet its predicate profile: {0}")]
+    ProfileViolation(String),
+
+    /// A verifier's accept-list does not contain the statement's predicate.
+    ///
+    /// Rejection is the only conforming outcome for an unrecognized predicate: it is not
+    /// processed as a generic statement, and no published equivalence is followed.
+    #[error("predicate `{0}` is not accepted by this verifier")]
+    PredicateNotAccepted(String),
+
+    /// A registry accept-list document could not be read.
+    #[error("malformed accept-list: {0}")]
+    MalformedAcceptList(String),
 
     /// A document a credential was to cite as its `taskContext` is not a Trust Task
     /// document that can be named: it is not a JSON object, or it has no string `id`.
     #[error("cannot cite this document as a taskContext: {0}")]
     MalformedTaskDocument(String),
 
-    /// [DTGCredential::new_vwc_for_session] was given something other than the
+    /// [DTGCredential::new_witnessed_vsc] was given something other than the
     /// `witness/session` document that opened the witness session.
     ///
     /// A VWC names the *innermost* exchange that attests the witnessing (Trust Tasks
@@ -206,7 +358,7 @@ pub enum DTGCredentialError {
 
 /// Defined DTG Credentials
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(try_from = "DTGCommon")]
+#[serde(try_from = "Value")]
 pub struct DTGCredential {
     /// The DTG Credential inner struct
     #[serde(flatten)]
@@ -256,6 +408,24 @@ impl DTGCredential {
         self.credential.issuer()
     }
 
+    /// The correlation scope the issuer declares for its own identifier. See [IssuerScope].
+    pub fn issuer_scope(&self) -> IssuerScope {
+        self.credential.issuer_scope
+    }
+
+    /// The statement, when this credential is a VSC. See [DTGCommon::statement].
+    pub fn statement(&self) -> Option<&CredentialSubjectStatement> {
+        self.credential.statement()
+    }
+
+    /// The `predicate` IRI, when this credential is a VSC.
+    ///
+    /// Compare it byte for byte — [PredicateAcceptList] does — and never by spelling,
+    /// prefix or a published equivalence.
+    pub fn predicate(&self) -> Option<&str> {
+        self.statement().map(|s| s.predicate.as_str())
+    }
+
     /// Returns the Subject DID
     pub fn subject(&self) -> &str {
         self.credential.subject()
@@ -274,8 +444,8 @@ impl DTGCredential {
     /// The `id` naming the trust task exchange this credential cites, if set. See
     /// [DTGCommon::task_context].
     ///
-    /// This is always `Some` for [DTGCredentialType::Witness] credentials, where the spec
-    /// makes `taskContext` REQUIRED.
+    /// This is always `Some` for a VSC under a predicate profile that makes `taskContext`
+    /// REQUIRED — [WITNESSED_V1], [VETTED_V1] and [PRESENTED_V1].
     pub fn task_context(&self) -> Option<&str> {
         self.credential.task_context()
     }
@@ -337,8 +507,8 @@ impl DTGCredential {
     }
 
     /// This credential's digest, in the encoding a credential that references it carries —
-    /// a member-issued VMC acknowledging a membership grant, a VWC attesting an edge
-    /// credential, or the `parent` of an attenuated VAC.
+    /// a member-issued VMC acknowledging a membership grant, a VSC whose `object` names it
+    /// (a VWC attesting an edge credential), or the `parent` of an attenuated VAC.
     ///
     /// Per DTG Core Credentials [Digest Encoding], that is the SHA-256 hash of the
     /// credential's JSON representation **excluding its top-level `proof` member**,
@@ -403,15 +573,15 @@ impl DTGCredential {
 
     /// The digest this credential carries of the credential it references, if it carries one.
     ///
-    /// `Some` for a member-issued VMC (which MUST carry one), for a VWC bound to the edge
-    /// credential it attests, for an attenuated VAC (`authority.parent`), and for a
-    /// derived or accepting VDC (`delegation.parent` / `delegation.accepts`). `None` for a
-    /// community-issued VMC, which MUST omit it, and for a credential that references
-    /// nothing.
+    /// `Some` for a member-issued VMC (which MUST carry one), for a VSC whose `object` is a
+    /// `digestMultibase` (a VWC bound to the edge credential it attests, among them), for an
+    /// attenuated VAC (`authority.parent`), and for a derived or accepting VDC
+    /// (`delegation.parent` / `delegation.accepts`). `None` for a community-issued VMC,
+    /// which MUST omit it, and for a credential that references nothing.
     pub fn subject_digest(&self) -> Option<&str> {
         match &self.credential.credential_subject {
             CredentialSubject::Membership(subject) => subject.digest_multibase.as_deref(),
-            CredentialSubject::Witness(subject) => subject.digest_multibase.as_deref(),
+            CredentialSubject::Statement(subject) => subject.object.digest_multibase(),
             CredentialSubject::Authority(subject) => subject.authority.parent.as_deref(),
             CredentialSubject::Delegation(subject) => subject
                 .delegation
@@ -580,9 +750,15 @@ impl DTGCredential {
     ///
     /// - The validity window is well formed: `validUntil`, where present, is after
     ///   `validFrom` ([DTGCredentialError::InvalidValidityWindow]).
-    /// - No open JSON member — `endorsement`, `credentialStatus`, an unmodelled top-level
-    ///   member — takes the document past [`MAX_JSON_DEPTH`]
+    /// - No open JSON member — a statement's `object.value`, `credentialStatus`, an
+    ///   unmodelled member — takes the document past [`MAX_JSON_DEPTH`]
     ///   ([DTGCredentialError::JsonTooDeep]). The check does not recurse.
+    /// - Everything a parse checks still holds: the `@context` and `type` arrays, the
+    ///   subject's shape for the type, `issuerScope` where the type or profile constrains it,
+    ///   a VSC's `predicate`, and the constraints of its core profile — `taskContext` and
+    ///   `taskDigestMultibase` where [WITNESSED_V1], [VETTED_V1] or [PRESENTED_V1] require
+    ///   them. [DTGCredential::credential_mut] can break any of these, and this is where a
+    ///   broken credential is caught before it is signed.
     ///
     /// [DTGCredential::sign] calls this first, so this library never signs a credential
     /// that fails it, and [DTGCredential::verify_proof_with_public_key] calls it before
@@ -595,7 +771,58 @@ impl DTGCredential {
     /// ordering of the two ends is checked, never either end against the clock.
     pub fn validate(&self) -> Result<(), DTGCredentialError> {
         crate::create::check_window(self.valid_from(), self.valid_until())?;
-        self.credential.check_depth()
+        self.credential.check_depth()?;
+        self.check_conformance()
+    }
+
+    /// The structural rules a parse enforces, re-run over the model.
+    ///
+    /// Shared by `TryFrom<DTGCommon>` and [DTGCredential::validate], so that a credential
+    /// this library would refuse to parse is also one it refuses to sign.
+    fn check_conformance(&self) -> Result<(), DTGCredentialError> {
+        let c = &self.credential;
+        check_context(&c.context)?;
+        if check_type(&c.type_)? != self.type_ {
+            return Err(DTGCredentialError::InvalidType(format!(
+                "the type array no longer names a {}",
+                self.type_
+            )));
+        }
+
+        match (&self.type_, &c.credential_subject) {
+            (DTGCredentialType::Membership, CredentialSubject::Membership(subject)) => {
+                // A community's own identifier can only truthfully be declared `public`: a
+                // community that cannot be found cannot be joined. The grant is the half
+                // with no digest.
+                if subject.digest_multibase.is_none() && c.issuer_scope != IssuerScope::Public {
+                    return Err(DTGCredentialError::IssuerScopeTooNarrow {
+                        declared: c.issuer_scope,
+                        minimum: IssuerScope::Public,
+                    });
+                }
+            }
+            (
+                DTGCredentialType::Relationship
+                | DTGCredentialType::Invitation
+                | DTGCredentialType::Persona,
+                CredentialSubject::Basic(_),
+            ) => {}
+            (DTGCredentialType::Statement, CredentialSubject::Statement(subject)) => {
+                statement::check_statement(c, subject)?;
+            }
+            (DTGCredentialType::Authority, CredentialSubject::Authority(subject)) => {
+                if subject.authority.actions.is_empty() {
+                    // Emptiness is never a wildcard. Refusing here means a caller cannot
+                    // construct one by deserialization either.
+                    return Err(DTGCredentialError::EmptyAuthorityActions);
+                }
+            }
+            (DTGCredentialType::Delegation, CredentialSubject::Delegation(subject)) => {
+                check_delegation_shape(&subject.delegation)?;
+            }
+            _ => return Err(DTGCredentialError::UnknownCredential),
+        }
+        Ok(())
     }
 
     #[cfg(feature = "affinidi-signing")]
@@ -682,8 +909,8 @@ const MULTIHASH_SHA2_256: u64 = 0x12;
 /// The deepest JSON document this library will digest, sign or verify.
 ///
 /// Depth counts from the top of the credential: the document itself is depth 1, and each
-/// value inside an object or array is one deeper than its container. A VEC's `endorsement`
-/// therefore sits at depth 3, and a top-level member such as `credentialStatus` at depth 2.
+/// value inside an object or array is one deeper than its container. A VSC's `object.value`
+/// therefore sits at depth 4, and a top-level member such as `credentialStatus` at depth 2.
 ///
 /// # Why there is a bound
 ///
@@ -691,8 +918,8 @@ const MULTIHASH_SHA2_256: u64 = 0x12;
 /// of those recurses once per level of nesting. A value nested a few thousand levels deep
 /// exhausts the stack, and a stack overflow aborts the process — it is not an error a caller
 /// can handle. The members this library holds as open JSON are where such a value gets in:
-/// a VEC's `endorsement`, `credentialStatus`, and the unmodelled members in
-/// [`DTGCommon::extra`].
+/// a VSC's `object.value` and unmodelled subject members, `credentialStatus`, and the
+/// unmodelled members in [`DTGCommon::extra`].
 ///
 /// # Why this value
 ///
@@ -761,9 +988,9 @@ fn proofless(doc: &Value) -> Value {
 ///
 /// This is the encoding DTG Core Credentials calls `digestMultibase`, and every
 /// cross-credential reference in the specification uses it: the member-issued VMC's
-/// `digestMultibase` of the grant it acknowledges, the VWC's of the edge credential it
-/// attests, an attenuated VAC's `authority.parent`, and a VDC's `delegation.parent` and
-/// `delegation.accepts`.
+/// `digestMultibase` of the grant it acknowledges, a VSC's `object.digestMultibase` (a
+/// VWC's, of the edge credential it attests), an attenuated VAC's `authority.parent`, and a
+/// VDC's `delegation.parent` and `delegation.accepts`.
 ///
 /// Four steps, per [CID v1.0](https://www.w3.org/TR/cid-1.0/):
 ///
@@ -995,101 +1222,230 @@ pub fn digest_json(doc: &Value) -> Result<String, DTGCredentialError> {
     Ok(out)
 }
 
-/// TDG VC Type Identifiers
+/// DTG VC Type Identifiers — the concrete `DTGCredential` subtypes the v1 context defines.
 ///
 /// `PartialEq` is derived so that a consumer can assert by equality
 /// (`assert_eq!(cred.credential_type(), &DTGCredentialType::Delegation)`) rather than by
 /// pattern (`matches!`), which reports the actual variant on failure.
+///
+/// # What is no longer here
+///
+/// `EndorsementCredential` and `WitnessCredential` are not DTG types: DTG Core Credentials
+/// replaced them with the [DTGCredentialType::Statement] type under the [ENDORSES_V1] and
+/// [WITNESSED_V1] predicate profiles, and a VSC carries its meaning in `predicate` alone so
+/// that a type string and a predicate can never disagree. `RCardCredential` is not a DTG
+/// credential at all — the r-card is a verifiable data structure. A credential naming any
+/// of the three is refused at parse with [DTGCredentialError::InvalidType].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DTGCredentialType {
+    /// Verifiable Membership Credential (VMC) — one half of a membership edge.
     Membership,
+
+    /// Verifiable Relationship Credential (VRC) — one half of a relationship edge.
     Relationship,
+
+    /// Verifiable Invitation Credential (VIC).
     Invitation,
+
+    /// Verifiable Persona Credential (VPC).
     Persona,
-    Endorsement,
-    Witness,
+
+    /// Verifiable Statement Credential (VSC) — a signed statement by one node about
+    /// another, whose meaning is fixed by its `predicate`.
+    ///
+    /// The VEC and the VWC are VSCs under the [ENDORSES_V1] and [WITNESSED_V1] profiles.
+    Statement,
 
     /// Verifiable Authority Credential (VAC) — confers authority on a party to perform
     /// specified actions within a named scope governed by the issuer.
     ///
-    /// Merged into DTG Core Credentials at Working Draft 02
-    /// (`trustoverip/dtgwg-cred-spec` PR #29). Key control at invocation — a VAC is not a
-    /// bearer credential — is implemented in [crate::authority::verify_chain], ahead of
-    /// PR #41 which states it normatively and removes the `audience` property it made
-    /// redundant. Two further changes are in flight and not implemented here: revocation
-    /// (PR #39) and a `maxAttenuation` ceiling (PR #40).
+    /// Key control at invocation — a VAC is not a bearer credential — and the
+    /// `maxAttenuation` ceiling are implemented in [crate::authority::verify_chain].
+    /// Revocation via `credentialStatus` is a live lookup the caller performs.
     Authority,
 
     /// Verifiable Delegation Credential (VDC) — establishes that one entity may act in
     /// another's name.
-    ///
-    /// Merged into DTG Core Credentials at Working Draft 02
-    /// (`trustoverip/dtgwg-cred-spec` PR #19).
     Delegation,
-
-    /// R-Card is no longer a DTG credential type.
-    #[deprecated(
-        since = "0.2.0",
-        note = "The r-card is a verifiable data structure (VDS), not a DTGCredential subtype. \
-                It was removed from the DTG Core Credentials specification in Working Draft 01 \
-                and will be defined by the planned DTG Verifiable Data Structures specification. \
-                This variant will be removed in a future release."
-    )]
-    RCard,
 }
 
-impl Display for DTGCredentialType {
-    #[allow(deprecated)]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl DTGCredentialType {
+    /// The `type` string this subtype is named by on the wire.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            DTGCredentialType::Membership => write!(f, "MembershipCredential"),
-            DTGCredentialType::Relationship => write!(f, "RelationshipCredential"),
-            DTGCredentialType::Invitation => write!(f, "InvitationCredential"),
-            DTGCredentialType::Persona => write!(f, "PersonaCredential"),
-            DTGCredentialType::Endorsement => write!(f, "EndorsementCredential"),
-            DTGCredentialType::Witness => write!(f, "WitnessCredential"),
-            DTGCredentialType::Authority => write!(f, "AuthorityCredential"),
-            DTGCredentialType::Delegation => write!(f, "DelegationCredential"),
-            DTGCredentialType::RCard => write!(f, "RCardCredential"),
+            DTGCredentialType::Membership => "MembershipCredential",
+            DTGCredentialType::Relationship => "RelationshipCredential",
+            DTGCredentialType::Invitation => "InvitationCredential",
+            DTGCredentialType::Persona => "PersonaCredential",
+            DTGCredentialType::Statement => "StatementCredential",
+            DTGCredentialType::Authority => "AuthorityCredential",
+            DTGCredentialType::Delegation => "DelegationCredential",
         }
+    }
+
+    /// The subtype a `type` string names, if it names one.
+    fn from_type_str(type_: &str) -> Option<Self> {
+        DTG_TYPES.iter().find(|t| t.as_str() == type_).cloned()
     }
 }
 
-/// This helps with matching the right credential type to the [DTGCredentialType]
-const DTG_TYPES: [&str; 9] = [
-    "MembershipCredential",
-    "RelationshipCredential",
-    "InvitationCredential",
-    "PersonaCredential",
-    "EndorsementCredential",
-    "WitnessCredential",
-    "AuthorityCredential",
-    "DelegationCredential",
-    "RCardCredential",
-];
+impl Display for DTGCredentialType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 impl TryFrom<&[String]> for DTGCredentialType {
     type Error = DTGCredentialError;
 
-    #[allow(deprecated)]
+    /// The concrete subtype a `type` array names, under the same rules a parse applies: see
+    /// [DTGCredentialError::InvalidType].
     fn try_from(types: &[String]) -> Result<Self, Self::Error> {
-        if let Some(type_) = DTG_TYPES.iter().find(|t| types.contains(&t.to_string())) {
-            match *type_ {
-                "MembershipCredential" => Ok(DTGCredentialType::Membership),
-                "RelationshipCredential" => Ok(DTGCredentialType::Relationship),
-                "InvitationCredential" => Ok(DTGCredentialType::Invitation),
-                "PersonaCredential" => Ok(DTGCredentialType::Persona),
-                "EndorsementCredential" => Ok(DTGCredentialType::Endorsement),
-                "WitnessCredential" => Ok(DTGCredentialType::Witness),
-                "AuthorityCredential" => Ok(DTGCredentialType::Authority),
-                "DelegationCredential" => Ok(DTGCredentialType::Delegation),
-                "RCardCredential" => Ok(DTGCredentialType::RCard),
-                _ => Err(DTGCredentialError::UnknownCredential),
-            }
-        } else {
-            Err(DTGCredentialError::UnknownCredential)
+        check_type(types)
+    }
+}
+
+/// Every concrete subtype, in the order the v1 context defines them.
+const DTG_TYPES: [DTGCredentialType; 7] = [
+    DTGCredentialType::Membership,
+    DTGCredentialType::Relationship,
+    DTGCredentialType::Delegation,
+    DTGCredentialType::Invitation,
+    DTGCredentialType::Persona,
+    DTGCredentialType::Statement,
+    DTGCredentialType::Authority,
+];
+
+/// Type strings earlier drafts used for a DTG subtype, refused with a message naming what
+/// replaced them rather than as merely unknown.
+const RETIRED_TYPES: [(&str, &str); 3] = [
+    (
+        "EndorsementCredential",
+        "replaced by StatementCredential under the endorses/1 predicate",
+    ),
+    (
+        "WitnessCredential",
+        "replaced by StatementCredential under the witnessed/1 predicate",
+    ),
+    (
+        "RCardCredential",
+        "the r-card is a verifiable data structure, not a DTG credential",
+    ),
+];
+
+/// The non-authoritative personhood hint a community-issued VMC may carry in `type`.
+const PERSONHOOD_HINT: &str = "PersonhoodCredential";
+
+/// Reads the concrete subtype off a `type` array, refusing anything but
+/// `VerifiableCredential`, `DTGCredential`, exactly one concrete subtype and — on a VMC
+/// only — the `PersonhoodCredential` hint.
+///
+/// Every other string is refused, retired DTG types and unknown ones alike: a `type` the
+/// v1 context does not define is one this library cannot say it understood.
+fn check_type(types: &[String]) -> Result<DTGCredentialType, DTGCredentialError> {
+    let (mut vc, mut dtg, mut personhood) = (false, false, false);
+    let mut concrete: Option<DTGCredentialType> = None;
+
+    for type_ in types {
+        let seen = match type_.as_str() {
+            "VerifiableCredential" => std::mem::replace(&mut vc, true),
+            "DTGCredential" => std::mem::replace(&mut dtg, true),
+            PERSONHOOD_HINT => std::mem::replace(&mut personhood, true),
+            other => match DTGCredentialType::from_type_str(other) {
+                Some(found) => match &concrete {
+                    Some(already) if *already == found => true,
+                    Some(already) => {
+                        return Err(DTGCredentialError::InvalidType(format!(
+                            "names both {already} and {found}; a DTG credential has exactly \
+                             one concrete subtype"
+                        )));
+                    }
+                    None => {
+                        concrete = Some(found);
+                        false
+                    }
+                },
+                None => {
+                    let reason = RETIRED_TYPES
+                        .iter()
+                        .find(|(retired, _)| *retired == other)
+                        .map_or("not a type the DTG v1 context defines", |(_, why)| why);
+                    return Err(DTGCredentialError::InvalidType(format!(
+                        "`{other}`: {reason}"
+                    )));
+                }
+            },
+        };
+        if seen {
+            return Err(DTGCredentialError::InvalidType(format!(
+                "`{type_}` is listed twice"
+            )));
         }
+    }
+
+    if !vc || !dtg {
+        return Err(DTGCredentialError::InvalidType(
+            "must include both `VerifiableCredential` and `DTGCredential`".into(),
+        ));
+    }
+    let concrete = concrete.ok_or(DTGCredentialError::UnknownCredential)?;
+    if personhood && concrete != DTGCredentialType::Membership {
+        return Err(DTGCredentialError::InvalidType(format!(
+            "`{PERSONHOOD_HINT}` is a hint on a MembershipCredential only, not on a {concrete}"
+        )));
+    }
+    Ok(concrete)
+}
+
+/// Reads the W3C VC version off an `@context` array that lists the W3C context first and
+/// [DTG_CONTEXT_V1] second, refusing any other arrangement.
+///
+/// Further contexts — a proof suite's, a community vocabulary's — may follow in any number.
+fn check_context(context: &[String]) -> Result<W3CVCVersion, DTGCredentialError> {
+    let version = match context.first().map(String::as_str) {
+        Some(W3C_VC_V2_CONTEXT) => W3CVCVersion::V2_0,
+        Some(W3C_VC_V1_CONTEXT) => W3CVCVersion::V1_1,
+        _ => return Err(DTGCredentialError::UnknownVCVersion),
+    };
+    match context.get(1).map(String::as_str) {
+        Some(DTG_CONTEXT_V1) => Ok(version),
+        Some(other) => Err(DTGCredentialError::InvalidContext(format!(
+            "second entry is `{other}`, not `{DTG_CONTEXT_V1}`"
+        ))),
+        None => Err(DTGCredentialError::InvalidContext(format!(
+            "`{DTG_CONTEXT_V1}` is not listed second"
+        ))),
+    }
+}
+
+/// Refuses a `delegation` object that is neither a well-formed grant nor a well-formed
+/// acceptance.
+fn check_delegation_shape(d: &DelegationGrant) -> Result<(), DTGCredentialError> {
+    // The two halves are distinguished by `accepts`, and each half has exactly one shape.
+    match (&d.accepts, &d.scope) {
+        (Some(_), Some(_)) => Err(DTGCredentialError::MalformedDelegation(
+            "carries both `accepts` and `scope`: an acceptance consents to the scope of the \
+             grant it names rather than restating it"
+                .into(),
+        )),
+        (Some(_), None) if d.parent.is_some() || d.max_depth.is_some() => {
+            Err(DTGCredentialError::MalformedDelegation(
+                "an acceptance carries `accepts` and nothing else".into(),
+            ))
+        }
+        (Some(_), None) => Ok(()),
+        (None, Some(scope)) if scope.is_empty() => Err(DTGCredentialError::MalformedDelegation(
+            "a grant's `scope` MUST contain at least one entry — emptying it is not how an \
+             unbounded appointment is expressed, because there is no way to express one"
+                .into(),
+        )),
+        (None, Some(_)) => Ok(()),
+        (None, None) => Err(DTGCredentialError::MalformedDelegation(
+            "carries neither `scope` nor `accepts`, so it is neither a grant nor an \
+             acceptance"
+                .into(),
+        )),
     }
 }
 
@@ -1097,17 +1453,20 @@ impl TryFrom<&[String]> for DTGCredentialType {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DTGCommon {
-    /// JSON-LD links to contexts
-    /// Must contain at least:
-    /// - <https://www.w3.org/ns/credentials/v2>
-    /// - <https://firstperson.network/credentials/dtg/v1>
+    /// JSON-LD links to contexts.
+    ///
+    /// MUST list [W3C_VC_V2_CONTEXT] first (or, for a v1.1 credential,
+    /// [W3C_VC_V1_CONTEXT]) and [DTG_CONTEXT_V1] second, followed by any contexts a proof
+    /// type, a predicate profile or a community vocabulary requires. A later context MUST
+    /// NOT redefine a term the DTG context protects.
     #[serde(rename = "@context")]
     pub context: Vec<String>,
 
-    /// Credential type identifiers
-    /// Must contain at least:
-    /// DTGCredential
-    /// VerifiableCredential
+    /// Credential type identifiers.
+    ///
+    /// MUST include `VerifiableCredential`, `DTGCredential` and exactly one concrete
+    /// subtype. A community-issued VMC MAY add `PersonhoodCredential` as a non-authoritative
+    /// hint; nothing else is accepted.
     #[serde(rename = "type")]
     pub type_: Vec<String>,
 
@@ -1133,6 +1492,12 @@ pub struct DTGCommon {
     /// DID of the entity issuing this credential
     pub issuer: String,
 
+    /// The correlation scope the issuer declares for the identifier in `issuer`.
+    ///
+    /// REQUIRED: a credential without it, or with any value but `pairwise`, `directed` or
+    /// `public`, is refused at parse. See [IssuerScope].
+    pub issuer_scope: IssuerScope,
+
     /// ISO 8601 format of when this credentials become valid from
     #[serde(serialize_with = "iso8601_format", alias = "issuanceDate")]
     pub valid_from: DateTime<Utc>,
@@ -1155,9 +1520,9 @@ pub struct DTGCommon {
     /// Carry [`DTGCommon::task_digest_multibase`] with it, which binds the credential to
     /// the document this only names.
     ///
-    /// REQUIRED for [DTGCredentialType::Witness] credentials, OPTIONAL for all other DTG
-    /// credential types. A DTG credential without a `taskContext` MUST be interpretable
-    /// standing alone, independent of any exchange.
+    /// REQUIRED on a VSC whose predicate profile requires it ([WITNESSED_V1], [VETTED_V1],
+    /// [PRESENTED_V1]), OPTIONAL otherwise. A DTG credential without a `taskContext` MUST be
+    /// interpretable standing alone, independent of any exchange.
     ///
     /// NOTE: A verifier MUST NOT interpret a `taskContext`-bearing credential as proof that
     /// the associated trust task completed unless the matching trust task outcome evidence is
@@ -1179,12 +1544,10 @@ pub struct DTGCommon {
     /// digest-valued member of DTG Core Credentials. [`task_digest_multibase_json`] computes
     /// it; [DTGCredential::with_task_citation] sets it together with `taskContext`.
     ///
-    /// REQUIRED on a VWC issued through `witness/session` + `witness/session/submit` (the
-    /// latter's Conformance, item 1), and proposed as REQUIRED wherever `taskContext` is
-    /// REQUIRED in DTG Core Credentials (trustoverip/dtgwg-cred-spec#56). It is `Option`
-    /// here, and a VWC without one still deserializes, because every VWC issued before the
-    /// member existed lacks it. [DTGCredential::cites_task] reports such a credential as
-    /// citing nothing rather than falling back to comparing `id`s.
+    /// REQUIRED wherever `taskContext` is REQUIRED, and SHOULD accompany it where it is
+    /// OPTIONAL. A VSC under a profile requiring it is refused at parse without one.
+    /// [DTGCredential::cites_task] reports a credential without one as citing nothing rather
+    /// than falling back to comparing `id`s.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub task_digest_multibase: Option<String>,
 
@@ -1251,17 +1614,42 @@ impl DTGCommon {
         &self.issuer
     }
 
+    /// The correlation scope the issuer declares for its own identifier.
+    pub fn issuer_scope(&self) -> IssuerScope {
+        self.issuer_scope
+    }
+
     /// Returns the subject DID
-    #[allow(deprecated)]
     pub fn subject(&self) -> &str {
         match &self.credential_subject {
             CredentialSubject::Basic(subject) => &subject.id,
-            CredentialSubject::Endorsement(subject) => &subject.id,
-            CredentialSubject::Witness(subject) => &subject.id,
+            CredentialSubject::Statement(subject) => &subject.id,
             CredentialSubject::Membership(subject) => &subject.id,
             CredentialSubject::Authority(subject) => &subject.id,
             CredentialSubject::Delegation(subject) => &subject.id,
-            CredentialSubject::RCard(subject) => &subject.id,
+        }
+    }
+
+    /// The statement — `predicate`, `object` and any profile members — when this
+    /// credential is a VSC.
+    ///
+    /// `None` for every other credential type, for the same reason [DTGCommon::authority]
+    /// is fallible.
+    pub fn statement(&self) -> Option<&CredentialSubjectStatement> {
+        match &self.credential_subject {
+            CredentialSubject::Statement(subject) => Some(subject),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the statement, when this credential is a VSC.
+    ///
+    /// Present for the same reason as [DTGCommon::authority_mut]: a verifier must be
+    /// testable against statements this library's own constructors would refuse to build.
+    pub fn statement_mut(&mut self) -> Option<&mut CredentialSubjectStatement> {
+        match &mut self.credential_subject {
+            CredentialSubject::Statement(subject) => Some(subject),
+            _ => None,
         }
     }
 
@@ -1340,19 +1728,19 @@ impl DTGCommon {
     ///
     /// Every other member is a type this library defines, none more than four levels deep,
     /// so the open members are the only place the bound can be crossed.
-    #[allow(deprecated)]
     fn check_depth(&self) -> Result<(), DTGCredentialError> {
-        // The document is depth 1, so a top-level member sits at 2 and a member of
-        // `credentialSubject` at 3.
+        // The document is depth 1, so a top-level member sits at 2, a member of
+        // `credentialSubject` at 3, and `object.value` at 4.
         let mut roots: Vec<(&Value, usize)> =
             self.extra.values().map(|member| (member, 2)).collect();
         if let Some(status) = &self.credential_status {
             roots.push((status, 2));
         }
-        match &self.credential_subject {
-            CredentialSubject::Endorsement(subject) => roots.push((&subject.endorsement, 3)),
-            CredentialSubject::RCard(subject) => roots.push((&subject.card, 3)),
-            _ => {}
+        if let CredentialSubject::Statement(subject) = &self.credential_subject {
+            if let Some(value) = subject.object.value() {
+                roots.push((value, 4));
+            }
+            roots.extend(subject.extra.values().map(|member| (member, 3)));
         }
 
         if exceeds_max_depth(roots) {
@@ -1365,229 +1753,108 @@ impl DTGCommon {
     }
 }
 
-/// Helps ensure default starting point is correct
-impl Default for DTGCommon {
-    fn default() -> Self {
-        DTGCommon {
-            context: vec![
-                "https://www.w3.org/ns/credentials/v2".to_string(),
-                "https://firstperson.network/credentials/dtg/v1".to_string(),
-            ],
-            type_: vec![
-                "VerifiableCredential".to_string(),
-                "DTGCredential".to_string(),
-            ],
-            id: None,
-            issuer: String::new(),
-            valid_from: Utc::now(),
-            valid_until: None,
-            task_context: None,
-            task_digest_multibase: None,
-            credential_subject: CredentialSubject::Basic(CredentialSubjectBasic {
-                id: String::new(),
-            }),
-            credential_status: None,
-            proof: None,
-            extra: serde_json::Map::new(),
+impl DTGCredential {
+    /// The skeleton every `new_*` constructor starts from: the two required contexts, the
+    /// three required types, and the members every credential carries.
+    ///
+    /// There is deliberately no `Default` for [DTGCommon]. A default would have to choose
+    /// an `issuerScope`, and a declaration nobody made is the one thing the member exists to
+    /// rule out.
+    pub(crate) fn build(
+        type_: DTGCredentialType,
+        issuer: String,
+        issuer_scope: IssuerScope,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+        credential_subject: CredentialSubject,
+    ) -> Self {
+        DTGCredential {
+            credential: DTGCommon {
+                context: vec![W3C_VC_V2_CONTEXT.to_string(), DTG_CONTEXT_V1.to_string()],
+                type_: vec![
+                    "VerifiableCredential".to_string(),
+                    "DTGCredential".to_string(),
+                    type_.to_string(),
+                ],
+                id: None,
+                issuer,
+                issuer_scope,
+                valid_from,
+                valid_until,
+                task_context: None,
+                task_digest_multibase: None,
+                credential_subject,
+                credential_status: None,
+                proof: None,
+                extra: serde_json::Map::new(),
+            },
+            type_,
+            version: W3CVCVersion::V2_0,
         }
     }
 }
 
-/// Post deserialize setup of a CredentialSubject and CredntialType
+/// Deserialization: `@context` and `type` are checked on the raw document first, so that a
+/// credential of a retired type, or under an unrecognized context, is refused with an error
+/// that says so — rather than with whatever the subject's shape happens to fail on.
+impl TryFrom<Value> for DTGCredential {
+    type Error = DTGCredentialError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let strings = |member: &str| -> Option<Vec<String>> {
+            value
+                .get(member)?
+                .as_array()?
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        if let Some(context) = strings("@context") {
+            check_context(&context)?;
+        }
+        if let Some(types) = strings("type") {
+            check_type(&types)?;
+        }
+
+        let common: DTGCommon = serde_json::from_value(value)
+            .map_err(|e| DTGCredentialError::MalformedCredential(e.to_string()))?;
+        DTGCredential::try_from(common)
+    }
+}
+
+/// Post deserialize setup of a CredentialSubject and CredentialType
 impl TryFrom<DTGCommon> for DTGCredential {
     type Error = DTGCredentialError;
 
-    #[allow(deprecated)]
     fn try_from(value: DTGCommon) -> Result<Self, Self::Error> {
-        match &value.type_.as_slice().try_into()? {
-            DTGCredentialType::Membership => {
-                // Normalize whichever variant the untagged subject match landed on into
-                // `Membership`, so a caller matching on the subject of a VMC sees one shape
-                // rather than two. See [CredentialSubject::Membership] for why the untagged
-                // match cannot make this decision itself.
-                let subject = match &value.credential_subject {
-                    // Already normalized — a credential built by `new_vmc` /
-                    // `new_member_vmc` rather than deserialized.
-                    CredentialSubject::Membership(subject) => subject.clone(),
+        let version = check_context(&value.context)?;
+        let type_ = check_type(&value.type_)?;
 
-                    // `{ id }` — the community-issued grant, which MUST omit `digest`.
-                    CredentialSubject::Basic(subject) => CredentialSubjectMembership {
-                        id: subject.id.clone(),
-                        digest_multibase: None,
-                    },
-
-                    // `{ id, digest }` — the member-issued acknowledgement. Shape-identical
-                    // to a VWC subject, which wins the untagged match; on a
-                    // MembershipCredential it is this. A `witnessContext` alongside it is
-                    // not: that property belongs to a VWC and has no meaning here, so a VMC
-                    // carrying one is malformed rather than merely surprising.
-                    CredentialSubject::Witness(subject) if subject.witness_context.is_none() => {
-                        CredentialSubjectMembership {
-                            id: subject.id.clone(),
-                            digest_multibase: subject.digest_multibase.clone(),
-                        }
-                    }
-
-                    _ => return Err(DTGCredentialError::UnknownCredential),
-                };
-
-                Ok(DTGCredential {
-                    type_: DTGCredentialType::Membership,
-                    version: value.context.as_slice().try_into()?,
-                    credential: DTGCommon {
-                        credential_subject: CredentialSubject::Membership(subject),
-                        ..value
-                    },
-                })
-            }
-            DTGCredentialType::Relationship => Ok(DTGCredential {
-                type_: DTGCredentialType::Relationship,
-                version: value.context.as_slice().try_into()?,
-                credential: value,
-            }),
-            DTGCredentialType::Invitation => Ok(DTGCredential {
-                type_: DTGCredentialType::Invitation,
-                version: value.context.as_slice().try_into()?,
-                credential: value,
-            }),
-            DTGCredentialType::Persona => Ok(DTGCredential {
-                type_: DTGCredentialType::Persona,
-                version: value.context.as_slice().try_into()?,
-                credential: value,
-            }),
-            DTGCredentialType::Endorsement => {
-                if let CredentialSubject::Endorsement { .. } = &value.credential_subject {
-                    Ok(DTGCredential {
-                        type_: DTGCredentialType::Endorsement,
-                        version: value.context.as_slice().try_into()?,
-                        credential: value,
-                    })
-                } else {
-                    Err(DTGCredentialError::UnknownCredential)
-                }
-            }
-            DTGCredentialType::Witness => {
-                // taskContext is REQUIRED on a VWC: the meaning of a witness attestation
-                // depends on the conditions it was made under, which live in the trust task
-                // exchange it is bound to.
-                if value.task_context.is_none() {
-                    return Err(DTGCredentialError::MissingTaskContext);
-                }
-
-                match &value.credential_subject {
-                    CredentialSubject::Witness(_) => Ok(DTGCredential {
-                        type_: DTGCredentialType::Witness,
-                        version: value.context.as_slice().try_into()?,
-                        credential: value,
-                    }),
-                    CredentialSubject::Basic(subject) => {
-                        // If Witness CredentialSubject only contains id, it is still valid
-                        Ok(DTGCredential {
-                            type_: DTGCredentialType::Witness,
-                            version: value.context.as_slice().try_into()?,
-                            credential: DTGCommon {
-                                credential_subject: CredentialSubject::Witness(
-                                    CredentialSubjectWitness {
-                                        id: subject.id.clone(),
-                                        digest_multibase: None,
-                                        witness_context: None,
-                                    },
-                                ),
-                                ..value
-                            },
-                        })
-                    }
-                    _ => Err(DTGCredentialError::UnknownCredential),
-                }
-            }
-            DTGCredentialType::Authority => {
-                // A VAC's subject must actually carry the grant. `Basic` — a bare `{ id }` —
-                // is the shape a caller lands on when the `authority` member is missing
-                // entirely, and a credential that confers nothing is malformed rather than
-                // merely empty. There is no normalization to do here (unlike VMC/VWC, whose
-                // shapes collide): `authority` is unique to this subject.
-                match &value.credential_subject {
-                    CredentialSubject::Authority(subject) => {
-                        if subject.authority.actions.is_empty() {
-                            // Emptiness is never a wildcard. Refusing here means a caller
-                            // cannot construct one by deserialization either.
-                            return Err(DTGCredentialError::EmptyAuthorityActions);
-                        }
-                        Ok(DTGCredential {
-                            type_: DTGCredentialType::Authority,
-                            version: value.context.as_slice().try_into()?,
-                            credential: value,
-                        })
-                    }
-                    _ => Err(DTGCredentialError::UnknownCredential),
-                }
-            }
-            DTGCredentialType::Delegation => {
-                // A VDC's subject must carry the appointment. `Basic` — a bare `{ id }` —
-                // is where a caller lands when `delegation` is missing entirely, and a
-                // credential that appoints nobody to nothing is malformed rather than
-                // merely empty.
-                match &value.credential_subject {
-                    CredentialSubject::Delegation(subject) => {
-                        let d = &subject.delegation;
-
-                        // The two halves are distinguished by `accepts`, and each half has
-                        // exactly one shape. Refusing the mixtures here means a caller
-                        // cannot construct one by deserialization either.
-                        match (&d.accepts, &d.scope) {
-                            (Some(_), Some(_)) => {
-                                return Err(DTGCredentialError::MalformedDelegation(
-                                    "carries both `accepts` and `scope`: an acceptance \
-                                     consents to the scope of the grant it names rather \
-                                     than restating it"
-                                        .into(),
-                                ));
-                            }
-                            (Some(_), None) => {
-                                if d.parent.is_some() || d.max_depth.is_some() {
-                                    return Err(DTGCredentialError::MalformedDelegation(
-                                        "an acceptance carries `accepts` and nothing else".into(),
-                                    ));
-                                }
-                            }
-                            (None, Some(scope)) => {
-                                if scope.is_empty() {
-                                    return Err(DTGCredentialError::MalformedDelegation(
-                                        "a grant's `scope` MUST contain at least one \
-                                         entry — emptying it is not how an unbounded \
-                                         appointment is expressed, because there is no \
-                                         way to express one"
-                                            .into(),
-                                    ));
-                                }
-                            }
-                            (None, None) => {
-                                return Err(DTGCredentialError::MalformedDelegation(
-                                    "carries neither `scope` nor `accepts`, so it is \
-                                     neither a grant nor an acceptance"
-                                        .into(),
-                                ));
-                            }
-                        }
-
-                        Ok(DTGCredential {
-                            type_: DTGCredentialType::Delegation,
-                            version: value.context.as_slice().try_into()?,
-                            credential: value,
-                        })
-                    }
-                    _ => Err(DTGCredentialError::UnknownCredential),
-                }
-            }
-            DTGCredentialType::RCard => match &value.credential_subject {
-                CredentialSubject::RCard { .. } => Ok(DTGCredential {
-                    type_: DTGCredentialType::RCard,
-                    version: value.context.as_slice().try_into()?,
-                    credential: value,
+        // A VMC's subject is normalized into `Membership`, so a caller matching on the
+        // subject of a VMC sees one shape rather than two: `{ id }` — the community-issued
+        // grant — is claimed first by the untagged match as `Basic`. See
+        // [CredentialSubject::Membership].
+        let value = match (&type_, value.credential_subject) {
+            (DTGCredentialType::Membership, CredentialSubject::Basic(subject)) => DTGCommon {
+                credential_subject: CredentialSubject::Membership(CredentialSubjectMembership {
+                    id: subject.id,
+                    digest_multibase: None,
                 }),
-                _ => Err(DTGCredentialError::UnknownCredential),
+                ..value
             },
-        }
+            (_, credential_subject) => DTGCommon {
+                credential_subject,
+                ..value
+            },
+        };
+
+        let credential = DTGCredential {
+            credential: value,
+            type_,
+            version,
+        };
+        credential.check_conformance()?;
+        Ok(credential)
     }
 }
 
@@ -1627,27 +1894,19 @@ where
 
 /// This represents all possible credential subjects
 /// The order of the enum is important as it will match on first match
-#[allow(deprecated)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum CredentialSubject {
-    /// Verifiable Endorsement Credential subject
-    Endorsement(CredentialSubjectEndorsement),
-
-    /// R-Card Credential subject
-    #[deprecated(
-        since = "0.2.0",
-        note = "The r-card is a verifiable data structure (VDS), not a DTGCredential subtype. \
-                See DTGCredentialType::RCard. This variant will be removed in a future release."
-    )]
-    RCard(CredentialSubjectRCard),
-
     /// Credential Subject of just `id`
     /// Used by a community-issued VMC, and by VRC, VIC and VPC
     Basic(CredentialSubjectBasic),
 
-    /// Verifiable Witness Credential subject
-    Witness(CredentialSubjectWitness),
+    /// Verifiable Statement Credential subject: `id`, `predicate`, `object`.
+    ///
+    /// Unambiguous under the untagged match: no other DTG subject carries a `predicate` or
+    /// an `object`, and both are REQUIRED here. Unmodelled members are kept rather than
+    /// refused, because a verifier MUST ignore members a profile does not define.
+    Statement(CredentialSubjectStatement),
 
     /// Verifiable Authority Credential subject.
     ///
@@ -1662,23 +1921,17 @@ pub enum CredentialSubject {
     /// carried by no other DTG subject.
     Delegation(CredentialSubjectDelegation),
 
-    /// Membership Credential subject, carrying the OPTIONAL `digest` that a member-issued
-    /// VMC MUST set.
+    /// Membership Credential subject, carrying the `digestMultibase` that a member-issued
+    /// VMC MUST set and a community-issued one MUST omit.
     ///
-    /// # Never selected by the untagged match, deliberately
+    /// # `{ id }` lands on `Basic` first
     ///
-    /// This variant sits last because its two shapes are already claimed above: `{ id }` is
-    /// [CredentialSubject::Basic], and `{ id, digest }` is indistinguishable from a VWC
-    /// subject with no `witnessContext`, which [CredentialSubject::Witness] takes first.
-    /// Nothing in the subject object itself separates a membership acknowledgement from a
-    /// witness attestation — only the credential's `type` does.
-    ///
-    /// So the shape is not decided here. `TryFrom<DTGCommon> for DTGCredential` normalizes
-    /// whichever variant the untagged match landed on into this one when `type` includes
-    /// `MembershipCredential`, the same way it already re-wraps a `Basic` subject as
-    /// `Witness` on a VWC. Deserialization is therefore deterministic rather than
-    /// order-dependent, and a `Membership` subject reaching a matcher has been through that
-    /// normalization.
+    /// The grant's shape is also [CredentialSubject::Basic]'s, which the untagged match
+    /// takes first; only the credential's `type` says it is a membership. So
+    /// `TryFrom<DTGCommon> for DTGCredential` re-wraps a `Basic` subject as this one when
+    /// `type` includes `MembershipCredential`, and a `Membership` subject reaching a matcher
+    /// has been through that normalization. The acknowledgement's `{ id, digestMultibase }`
+    /// lands here directly.
     Membership(CredentialSubjectMembership),
 }
 
@@ -1733,8 +1986,21 @@ pub struct AuthorityGrant {
     /// re-issuing a parent with different claims does not re-parent the children of the
     /// old one, while re-proofing it with identical claims leaves them undisturbed,
     /// because the digest excludes `proof`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parent: Option<String>,
+
+    /// The number of further attenuations permitted below this VAC.
+    ///
+    /// `0` prohibits attenuating it at all. **Absence permits** attenuation as far as
+    /// [crate::authority::MAX_CHAIN_DEPTH] allows — the opposite default from a VDC's
+    /// `maxDepth`, deliberately: an attenuation only narrows and its subject acts as
+    /// itself, and forbidding it pushes a holder to lend their own key instead.
+    ///
+    /// A VAC attenuated from a parent bearing `n` MUST NOT bear more than `n - 1`, and
+    /// nothing may lie more than `n` steps below it. Any link may set a lower limit, or set
+    /// one where its parent set none; none may raise one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_attenuation: Option<u32>,
 }
 
 /// The `delegation` object a [CredentialSubject::Delegation] carries.
@@ -1833,88 +2099,40 @@ pub struct CredentialSubjectMembership {
     /// `Option` rather than two structs because the same property distinguishes the two
     /// directions: a type that could not represent both could not deserialize the pair.
     ///
-    /// Serializes as `digestMultibase`. The Working Draft 01 name `digest` is accepted on
-    /// the wire so that credentials issued against that draft still parse; the *value*
-    /// encoding also changed, so such a credential parses and then fails to compare, with
-    /// [DTGCredentialError::InvalidDigest] rather than a silent mismatch.
-    #[serde(
-        rename = "digestMultibase",
-        alias = "digest",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
+    /// Serializes as `digestMultibase`. The Working Draft 01 name `digest` is no longer
+    /// accepted: a credential issued before the Implementers Draft is not conformant.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub digest_multibase: Option<String>,
 }
 
-/// Endorsement Credential subject
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialSubjectEndorsement {
-    pub id: String,
-    /// There is no spec for the endorsement content, so we use a generic JSON value
-    pub endorsement: Value,
-}
-
-/// Witness Credential subject
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CredentialSubjectWitness {
-    pub id: String,
-
-    /// Digest of the witnessed edge credential, as [DTGCredential::digest_multibase]
-    /// computes it. REQUIRED by the specification — a VWC without one names the observed
-    /// party and the exchange, but not which edge was witnessed.
-    ///
-    /// Serializes as `digestMultibase`; the Working Draft 01 name `digest` is accepted on
-    /// the wire.
-    #[serde(
-        rename = "digestMultibase",
-        alias = "digest",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
-    pub digest_multibase: Option<String>,
-
-    /// There is no spec for the witness context content, so we use a generic JSON value
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub witness_context: Option<WitnessContext>,
-}
-
-/// Witness Credential Context
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// The `witnessContext` a [WITNESSED_V1] statement MAY carry: context of the witnessing
+/// event.
+///
+/// Every member is OPTIONAL, and the member set is frozen with the predicate version —
+/// `witnessed/1`'s schema admits no others, so an unknown member is refused. The terms are
+/// defined in [DTG_CONTEXT_V1].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WitnessContext {
     /// Human-readable event name
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub event: Option<String>,
 
     /// Session or nonce identifier
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub session_id: Option<String>,
 
-    ///Verification method used
+    /// Verification method used
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub method: Option<String>,
 }
 
-/// R-Card Credential subject
-#[deprecated(
-    since = "0.2.0",
-    note = "The r-card is a verifiable data structure (VDS), not a DTGCredential subtype. \
-            See DTGCredentialType::RCard. This struct will be removed in a future release."
-)]
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialSubjectRCard {
-    pub id: String,
-
-    /// JCard spec, generic JSON value
-    pub card: Value,
-}
-
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use crate::{
-        CredentialSubject, CredentialSubjectRCard, DTGCommon, DTGCredential, DTGCredentialError,
-        DTGCredentialType, W3CVCVersion, decode_digest_multibase, digest_multibase_json,
+        CredentialSubject, DTG_CONTEXT_V1, DTGCommon, DTGCredential, DTGCredentialError,
+        DTGCredentialType, ENDORSES_V1, IssuerScope, W3C_VC_V2_CONTEXT, W3CVCVersion, WITNESSED_V1,
+        check_predicate_iri, check_type, decode_digest_multibase, digest_multibase_json,
         digests_match,
     };
     use chrono::{DateTime, Utc};
@@ -1929,11 +2147,12 @@ mod tests {
             r#"{
 "@context": [
     "https://www.w3.org/2018/credentials/v1",
-    "https://firstperson.network/credentials/dtg/v1",
+    "https://registry.trustoverip.org/dtg/context/v1",
     "https://w3id.org/security/suites/ed25519-2020/v1"
   ],
   "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
   "issuer": "did:web:chess-club.example",
+  "issuerScope": "public",
   "issuanceDate": "2026-01-06T10:00:00Z",
   "expirationDate": "2027-01-06T10:00:00Z",
   "credentialSubject": {
@@ -1961,11 +2180,12 @@ mod tests {
             serde_json::from_str::<DTGCredential>(
                 r#"{
 "@context": [
-    "https://firstperson.network/credentials/dtg/v1",
+    "https://registry.trustoverip.org/dtg/context/v1",
     "https://w3id.org/security/suites/ed25519-2020/v1"
   ],
   "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
   "issuer": "did:web:chess-club.example",
+  "issuerScope": "public",
   "issuanceDate": "2026-01-06T10:00:00Z",
   "expirationDate": "2027-01-06T10:00:00Z",
   "credentialSubject": {
@@ -1998,9 +2218,10 @@ mod tests {
     fn test_vmc_deserialize() {
         let vmc: DTGCredential = match serde_json::from_str(
             r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://registry.trustoverip.org/dtg/context/v1"],
                 "type": ["VerifiableCredential", "DTGCredential",  "MembershipCredential"],
                 "issuer": "did:example:community",
+                "issuerScope": "public",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": { "id": "did:example:rDid" }
             }"#,
@@ -2022,9 +2243,10 @@ mod tests {
     fn test_vmc_phc_deserialize() {
         let vmc: DTGCredential = match serde_json::from_str(
             r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://registry.trustoverip.org/dtg/context/v1"],
                 "type": ["VerifiableCredential", "DTGCredential",  "MembershipCredential", "PersonhoodCredential"],
                 "issuer": "did:example:community",
+                "issuerScope": "public",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": { "id": "did:example:rDid" }
             }"#,
@@ -2045,9 +2267,10 @@ mod tests {
     fn test_vrc_deserialize() {
         let vrc: DTGCredential = match serde_json::from_str(
             r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://registry.trustoverip.org/dtg/context/v1"],
                 "type": ["VerifiableCredential", "DTGCredential",  "RelationshipCredential"],
                 "issuer": "did:example:governmentAgencyDid",
+                "issuerScope": "public",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": { "id": "did:example:citizenRDid" }
             }"#,
@@ -2067,9 +2290,10 @@ mod tests {
     fn test_vic_deserialize() {
         let vic: DTGCredential = match serde_json::from_str(
             r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://registry.trustoverip.org/dtg/context/v1"],
                 "type": ["VerifiableCredential", "DTGCredential",  "InvitationCredential"],
                 "issuer": "did:example:governmentAgencyVicDid",
+                "issuerScope": "public",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": { "id": "did:example:citizenRDid" }
             }"#,
@@ -2090,9 +2314,10 @@ mod tests {
     fn test_vpc_deserialize() {
         let vpc: DTGCredential = match serde_json::from_str(
             r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://registry.trustoverip.org/dtg/context/v1"],
                 "type": ["VerifiableCredential", "DTGCredential",  "PersonaCredential"],
                 "issuer": "did:example:governmentAgencyDid",
+                "issuerScope": "public",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": { "id": "did:example:citizenRDid" }
             }"#,
@@ -2108,201 +2333,445 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_vec_deserialize() {
-        let vec: DTGCredential = match serde_json::from_str(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "EndorsementCredential"],
-                "issuer": "did:example:governmentAgencyDid",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "credentialSubject": { "id": "did:example:citizenRDid", "endorsement": {} }
-            }"#,
-        ) {
-            Ok(vec) => vec,
-            Err(e) => panic!("Couldn't deserialize VEC: {}", e),
-        };
-
-        assert!(matches!(vec.type_, DTGCredentialType::Endorsement));
-        assert!(matches!(vec.subject(), "did:example:citizenRDid"));
-        assert!(matches!(
-            vec.credential().credential_subject,
-            CredentialSubject::Endorsement(_)
-        ));
+    /// A minimal conformant credential of `type_` with `subject`, for the parse tests below.
+    fn doc(type_: &str, scope: &str, subject: Value) -> Value {
+        serde_json::json!({
+            "@context": [W3C_VC_V2_CONTEXT, DTG_CONTEXT_V1],
+            "type": ["VerifiableCredential", "DTGCredential", type_],
+            "issuer": "did:example:issuer",
+            "issuerScope": scope,
+            "validFrom": "2024-06-18T10:00:00Z",
+            "credentialSubject": subject,
+        })
     }
 
+    fn parse(value: Value) -> Result<DTGCredential, String> {
+        serde_json::from_value::<DTGCredential>(value).map_err(|e| e.to_string())
+    }
+
+    /// The spec's `dtg:endorses` example parses as a Statement, not as any retired type.
     #[test]
-    fn test_vec_bad_deserialize() {
-        match serde_json::from_str::<DTGCredential>(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "EndorsementCredential"],
-                "issuer": "did:example:governmentAgencyDid",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "credentialSubject": { "id": "did:example:citizenRDid", "other": [] }
-            }"#,
-        ) {
-            Ok(_) => panic!("Expected Unknown Credential type"),
-            Err(_) => {
-                // Good
+    fn test_vsc_deserialize() {
+        let vsc = parse(doc(
+            "StatementCredential",
+            "directed",
+            serde_json::json!({
+                "id": "did:example:subject",
+                "predicate": ENDORSES_V1,
+                "object": { "value": { "type": "SkillEndorsement" } }
+            }),
+        ))
+        .unwrap();
+
+        assert_eq!(vsc.type_(), DTGCredentialType::Statement);
+        assert_eq!(vsc.subject(), "did:example:subject");
+        assert_eq!(vsc.predicate(), Some(ENDORSES_V1));
+        assert_eq!(
+            vsc.statement().unwrap().object.value(),
+            Some(&serde_json::json!({ "type": "SkillEndorsement" }))
+        );
+    }
+
+    /// `object` carries exactly one of `id`, `digestMultibase` or `value`.
+    #[test]
+    fn test_vsc_object_is_exactly_one_member() {
+        let with = |object: Value| {
+            parse(doc(
+                "StatementCredential",
+                "directed",
+                serde_json::json!({
+                    "id": "did:example:subject",
+                    "predicate": "https://vtc.example/vocab#p",
+                    "object": object
+                }),
+            ))
+        };
+
+        assert!(with(serde_json::json!({ "id": "did:example:thing" })).is_ok());
+        assert!(with(serde_json::json!({ "digestMultibase": "zQm" })).is_ok());
+        assert!(with(serde_json::json!({ "value": null })).is_ok());
+
+        assert!(with(serde_json::json!({})).is_err(), "no member");
+        assert!(
+            with(serde_json::json!({ "id": "did:example:a", "value": 1 })).is_err(),
+            "two members"
+        );
+        assert!(
+            with(serde_json::json!({ "other": 1 })).is_err(),
+            "unknown member"
+        );
+        assert!(
+            with(serde_json::json!({ "id": "not-an-iri" })).is_err(),
+            "`object.id` is a DID or other IRI"
+        );
+    }
+
+    /// A verifier MUST ignore subject members a profile does not define, and a round trip
+    /// must keep them or the digest would change.
+    #[test]
+    fn test_vsc_keeps_unmodelled_subject_members() {
+        let wire = doc(
+            "StatementCredential",
+            "directed",
+            serde_json::json!({
+                "id": "did:example:subject",
+                "predicate": "https://vtc.example/vocab#p",
+                "object": { "value": 1 },
+                "note": { "added": "by a later profile version" }
+            }),
+        );
+        let vsc = parse(wire.clone()).unwrap();
+        assert!(vsc.statement().unwrap().extra.contains_key("note"));
+        assert_eq!(
+            vsc.digest_multibase().unwrap(),
+            digest_multibase_json(&wire).unwrap()
+        );
+    }
+
+    /// A compact form is malformed, not unknown, and no expansion is performed.
+    #[test]
+    fn test_vsc_predicate_must_be_an_absolute_nfc_iri() {
+        for bad in [
+            "dtg:witnessed",
+            "witnessed",
+            "/dtg/vsc/witnessed/1",
+            "https://registry.trustoverip.org/dtg/vsc/witnessed/1 ",
+            "https:///no-authority",
+            // "e" followed by a combining acute accent: renders as "é", is not NFC.
+            "https://vtc.example/vocab#caf\u{0065}\u{0301}",
+        ] {
+            let result = parse(doc(
+                "StatementCredential",
+                "public",
+                serde_json::json!({
+                    "id": "did:example:subject",
+                    "predicate": bad,
+                    "object": { "value": true }
+                }),
+            ));
+            assert!(result.is_err(), "`{bad}` must be refused");
+        }
+
+        for good in [
+            WITNESSED_V1,
+            "https://vtc.example/vocab/vetting/v1#vetted",
+            "https://vtc.example/vocab#caf\u{00e9}",
+            "urn:example:predicate:1",
+            "did:example:vocab#term",
+        ] {
+            check_predicate_iri(good).unwrap_or_else(|e| panic!("`{good}`: {e}"));
+        }
+    }
+
+    /// The core profile constraints hold at parse: `witnessed/1` requires the citation and a
+    /// scope of at least `directed`, and names a credential by digest.
+    #[test]
+    fn test_vsc_witnessed_profile_is_enforced_at_parse() {
+        let witnessed = |scope: &str, cited: bool, object: Value| {
+            let mut vwc = doc(
+                "StatementCredential",
+                scope,
+                serde_json::json!({
+                    "id": "did:example:subject",
+                    "predicate": WITNESSED_V1,
+                    "object": object,
+                    "witnessContext": { "method": "in-person-proximity" }
+                }),
+            );
+            if cited {
+                vwc["taskContext"] = serde_json::json!("urn:uuid:session");
+                vwc["taskDigestMultibase"] =
+                    serde_json::json!("zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n");
             }
+            serde_json::from_value::<DTGCredential>(vwc)
         };
-    }
+        let digest = serde_json::json!({ "digestMultibase": "zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n" });
 
-    #[test]
-    fn test_vwc_simple_deserialize() {
-        let vwc: DTGCredential = match serde_json::from_str(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "WitnessCredential"],
-                "issuer": "did:example:governmentAgencyDid",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "taskContext": "thread-abc-123",
-                "credentialSubject": { "id": "did:example:citizenRDid" }
-            }"#,
-        ) {
-            Ok(vwc) => vwc,
-            Err(e) => panic!("Couldn't deserialize VWC: {}", e),
-        };
+        let vwc = witnessed("directed", true, digest.clone()).unwrap();
+        assert_eq!(
+            vwc.statement()
+                .unwrap()
+                .witness_context
+                .as_ref()
+                .unwrap()
+                .method
+                .as_deref(),
+            Some("in-person-proximity")
+        );
+        assert!(witnessed("public", true, digest.clone()).is_ok());
 
-        assert!(matches!(vwc.type_, DTGCredentialType::Witness));
-        assert!(matches!(vwc.subject(), "did:example:citizenRDid"));
-        assert_eq!(vwc.task_context(), Some("thread-abc-123"));
+        assert!(witnessed("pairwise", true, digest.clone()).is_err());
+        assert!(witnessed("directed", false, digest.clone()).is_err());
+        assert!(witnessed("directed", true, serde_json::json!({ "value": {} })).is_err());
+
+        // Without the digest the citation only names the session, which the profile does
+        // not accept either.
+        let mut named_only = doc(
+            "StatementCredential",
+            "directed",
+            serde_json::json!({
+                "id": "did:example:subject",
+                "predicate": WITNESSED_V1,
+                "object": digest
+            }),
+        );
+        named_only["taskContext"] = serde_json::json!("urn:uuid:session");
         assert!(matches!(
-            vwc.credential().credential_subject,
-            CredentialSubject::Witness(_)
+            parse_err(named_only),
+            DTGCredentialError::MissingTaskDigest
         ));
     }
 
-    #[test]
-    fn test_vwc_full_deserialize() {
-        let vwc: DTGCredential = match serde_json::from_str(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "WitnessCredential"],
-                "issuer": "did:example:governmentAgencyDid",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "taskContext": "thread-abc-123",
-                "credentialSubject": { "id": "did:example:citizenRDid", "digestMultibase": "abcdf", "witnessContext": {} }
-            }"#,
-        ) {
-            Ok(vwc) => vwc,
-            Err(e) => panic!("Couldn't deserialize VWC: {}", e),
-        };
-
-        assert!(matches!(vwc.type_(), DTGCredentialType::Witness));
-        assert!(matches!(
-            vwc.credential().credential_subject,
-            CredentialSubject::Witness(_)
-        ));
+    /// The error a parse fails with, recovered through the model so it can be matched.
+    fn parse_err(value: Value) -> DTGCredentialError {
+        let mut common: DTGCommon = serde_json::from_value(value).expect("shape parses");
+        common.proof = None;
+        DTGCredential::try_from(common).expect_err("refused")
     }
 
+    /// Every credential declares `issuerScope`, exactly lowercase.
     #[test]
-    fn test_vwc_bad_deserialize() {
-        if serde_json::from_str::<DTGCredential>(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "WitnessCredential"],
-                "issuer": "did:example:governmentAgencyDid",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "taskContext": "thread-abc-123",
-                "credentialSubject": { "id": "did:example:citizenRDid", "digestMultibase": "abcdf", "wrongContext": {}  }
-            }"#,
-        ).is_ok() {
-            panic!("Should have failed due to wrong CredentialSubject!");
+    fn test_issuer_scope_is_required_and_case_sensitive() {
+        let subject = serde_json::json!({ "id": "did:example:subject" });
+        for scope in ["pairwise", "directed", "public"] {
+            let vrc = parse(doc("RelationshipCredential", scope, subject.clone())).unwrap();
+            assert_eq!(vrc.issuer_scope().as_str(), scope);
+            assert_eq!(scope.parse::<IssuerScope>().unwrap(), vrc.issuer_scope());
+        }
+
+        for scope in ["Public", "PAIRWISE", "community", ""] {
+            assert!(
+                parse(doc("RelationshipCredential", scope, subject.clone())).is_err(),
+                "`{scope}` is not a declaration"
+            );
+            assert!(scope.parse::<IssuerScope>().is_err());
+        }
+
+        let mut missing = doc("RelationshipCredential", "pairwise", subject);
+        missing.as_object_mut().unwrap().remove("issuerScope");
+        let err = parse(missing).unwrap_err();
+        assert!(err.contains("issuerScope"), "{err}");
+    }
+
+    /// Narrowest first: a minimum is met by itself and by anything wider.
+    #[test]
+    fn test_issuer_scope_is_ordered() {
+        assert!(IssuerScope::Pairwise < IssuerScope::Directed);
+        assert!(IssuerScope::Directed < IssuerScope::Public);
+        assert!(IssuerScope::Public.satisfies(IssuerScope::Directed));
+        assert!(IssuerScope::Directed.satisfies(IssuerScope::Directed));
+        assert!(!IssuerScope::Pairwise.satisfies(IssuerScope::Directed));
+        assert_eq!(
+            serde_json::to_value(IssuerScope::Directed).unwrap(),
+            "directed"
+        );
+    }
+
+    /// A community's grant can only truthfully declare `public`; the member's
+    /// acknowledgement declares whatever the member chose.
+    #[test]
+    fn test_community_issued_vmc_must_be_public() {
+        let grant = |scope| {
+            doc(
+                "MembershipCredential",
+                scope,
+                serde_json::json!({ "id": "did:example:member" }),
+            )
+        };
+        assert!(parse(grant("public")).is_ok());
+        assert!(matches!(
+            parse_err(grant("directed")),
+            DTGCredentialError::IssuerScopeTooNarrow {
+                declared: IssuerScope::Directed,
+                minimum: IssuerScope::Public,
+            }
+        ));
+
+        let ack = doc(
+            "MembershipCredential",
+            "pairwise",
+            serde_json::json!({
+                "id": "did:example:community",
+                "digestMultibase": "zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n"
+            }),
+        );
+        assert_eq!(parse(ack).unwrap().issuer_scope(), IssuerScope::Pairwise);
+    }
+
+    /// The retired subtypes are refused, by name, rather than read as something else.
+    #[test]
+    fn test_retired_types_are_refused() {
+        for (retired, subject) in [
+            (
+                "EndorsementCredential",
+                serde_json::json!({ "id": "did:example:subject", "endorsement": {} }),
+            ),
+            (
+                "WitnessCredential",
+                serde_json::json!({ "id": "did:example:subject", "digestMultibase": "zQm" }),
+            ),
+            (
+                "RCardCredential",
+                serde_json::json!({ "id": "did:example:subject", "card": [] }),
+            ),
+        ] {
+            let mut vc = doc(retired, "public", subject);
+            vc["taskContext"] = serde_json::json!("urn:uuid:session");
+            let err = parse(vc).unwrap_err();
+            assert!(err.contains(retired), "{retired}: {err}");
         }
     }
 
+    /// Exactly one concrete subtype; `PersonhoodCredential` on a VMC only; nothing unknown.
     #[test]
-    fn test_rcard_simple_deserialize() {
-        let rcard: DTGCredential = match serde_json::from_str(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "RCardCredential"],
-                "issuer": "did:example:governmentAgencyDid",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "credentialSubject": { "id": "did:example:citizenRDid", "card": [] }
-            }"#,
-        ) {
-            Ok(rcard) => rcard,
-            Err(e) => panic!("Couldn't deserialize R-Card: {}", e),
+    fn test_type_array_rules() {
+        let subject = serde_json::json!({ "id": "did:example:subject" });
+        let with_types = |types: Value| {
+            let mut vc = doc("RelationshipCredential", "public", subject.clone());
+            vc["type"] = types;
+            parse(vc)
         };
 
-        assert!(matches!(rcard.type_(), DTGCredentialType::RCard));
-        assert!(matches!(rcard.subject(), "did:example:citizenRDid"));
-        assert!(matches!(
-            rcard.credential().credential_subject,
-            CredentialSubject::RCard(_)
-        ));
+        assert!(
+            with_types(serde_json::json!([
+                "VerifiableCredential",
+                "DTGCredential",
+                "RelationshipCredential",
+                "InvitationCredential"
+            ]))
+            .is_err(),
+            "two concrete subtypes"
+        );
+        assert!(
+            with_types(serde_json::json!([
+                "VerifiableCredential",
+                "RelationshipCredential"
+            ]))
+            .is_err(),
+            "no DTGCredential"
+        );
+        assert!(
+            with_types(serde_json::json!([
+                "VerifiableCredential",
+                "DTGCredential",
+                "RelationshipCredential",
+                "PersonhoodCredential"
+            ]))
+            .is_err(),
+            "the personhood hint belongs on a VMC"
+        );
+        assert!(
+            with_types(serde_json::json!([
+                "VerifiableCredential",
+                "DTGCredential",
+                "RelationshipCredential",
+                "SomethingElse"
+            ]))
+            .is_err(),
+            "an undefined type"
+        );
+        assert!(
+            with_types(serde_json::json!([
+                "VerifiableCredential",
+                "DTGCredential",
+                "RelationshipCredential",
+                "RelationshipCredential"
+            ]))
+            .is_err(),
+            "listed twice"
+        );
     }
 
+    /// The DTG context is listed second, exactly; the pre-v1 context is not recognized.
     #[test]
-    fn test_rcard_bad_deserialize() {
-        if serde_json::from_str::<DTGCredential>(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "RCardCredential"],
-                "issuer": "did:example:governmentAgencyDid",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "credentialSubject": { "id": "did:example:citizenRDid"  }
-            }"#,
-        )
-        .is_ok()
-        {
-            panic!("Should have failed due to wrong CredentialSubject!");
+    fn test_context_rules() {
+        let subject = serde_json::json!({ "id": "did:example:subject" });
+        let with_context = |context: Value| {
+            let mut vc = doc("RelationshipCredential", "public", subject.clone());
+            vc["@context"] = context;
+            parse(vc)
+        };
+
+        assert!(
+            with_context(serde_json::json!([
+                W3C_VC_V2_CONTEXT,
+                DTG_CONTEXT_V1,
+                "https://w3id.org/security/suites/ed25519-2020/v1"
+            ]))
+            .is_ok(),
+            "further contexts may follow"
+        );
+        for bad in [
+            serde_json::json!([W3C_VC_V2_CONTEXT]),
+            serde_json::json!([DTG_CONTEXT_V1, W3C_VC_V2_CONTEXT]),
+            serde_json::json!([
+                W3C_VC_V2_CONTEXT,
+                "https://firstperson.network/credentials/dtg/v1"
+            ]),
+            serde_json::json!([
+                W3C_VC_V2_CONTEXT,
+                "https://www.registry.trustoverip.org/dtg/context/v1"
+            ]),
+            serde_json::json!([
+                W3C_VC_V2_CONTEXT,
+                "https://registry.trustoverip.org/dtg/context/v1/"
+            ]),
+            serde_json::json!([
+                W3C_VC_V2_CONTEXT,
+                "https://w3id.org/security/suites/ed25519-2020/v1",
+                DTG_CONTEXT_V1
+            ]),
+        ] {
+            assert!(with_context(bad.clone()).is_err(), "{bad}");
         }
     }
+
     #[test]
     fn test_deserialize_unknown() {
         match serde_json::from_str::<DTGCredential>(
             r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "UnknownCredential"],
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://registry.trustoverip.org/dtg/context/v1"],
+                "type": ["VerifiableCredential", "DTGCredential"],
                 "issuer": "did:example:governmentAgencyDid",
+                "issuerScope": "public",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": { "id": "did:example:citizenRDid" }
             }"#,
         ) {
             Ok(_) => panic!("Expected Unknown Credential type"),
-            Err(e) => {
-                if e.to_string() == "Unknown credential type" {
-                    // test passed
-                } else {
-                    panic!("Wrong error type returned");
-                }
-            }
+            Err(e) => assert_eq!(e.to_string(), "Unknown credential type"),
         };
     }
 
+    /// A subject whose shape does not fit the type is refused rather than coerced.
     #[test]
     fn test_deserialize_mismatched_credential_subject() {
-        match serde_json::from_str::<DTGCredential>(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "EndorsementCredential"],
-                "issuer": "did:example:governmentAgencyDid",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "credentialSubject": { "id": "did:example:citizenRDid" }
-            }"#,
-        ) {
-            Ok(_) => panic!("Expected Unknown Credential type"),
-            Err(e) => {
-                if e.to_string() == "Unknown credential type" {
-                    // test passed
-                } else {
-                    panic!("Wrong error type returned");
-                }
-            }
-        };
+        for (type_, subject) in [
+            (
+                "StatementCredential",
+                serde_json::json!({ "id": "did:example:subject" }),
+            ),
+            (
+                "RelationshipCredential",
+                serde_json::json!({ "id": "did:example:s", "predicate": ENDORSES_V1, "object": { "value": 1 } }),
+            ),
+            (
+                "AuthorityCredential",
+                serde_json::json!({ "id": "did:example:subject" }),
+            ),
+        ] {
+            assert!(parse(doc(type_, "public", subject)).is_err(), "{type_}");
+        }
     }
 
     #[test]
     fn test_proof_signed() {
         let cred: DTGCredential = match serde_json::from_str(
             r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://registry.trustoverip.org/dtg/context/v1"],
                 "type": ["VerifiableCredential", "DTGCredential",  "MembershipCredential"],
                 "issuer": "did:example:community",
+                "issuerScope": "public",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": { "id": "did:example:rDid" },
                 "proof": {
@@ -2325,18 +2794,12 @@ mod tests {
 
     #[test]
     fn test_proof_not_signed() {
-        let cred: DTGCredential = match serde_json::from_str(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "MembershipCredential"],
-                "issuer": "did:example:community",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "credentialSubject": { "id": "did:example:rDid" }
-            }"#,
-        ) {
-            Ok(vmc) => vmc,
-            Err(e) => panic!("Couldn't deserialize credential: {}", e),
-        };
+        let cred = parse(doc(
+            "MembershipCredential",
+            "public",
+            serde_json::json!({ "id": "did:example:rDid" }),
+        ))
+        .unwrap();
 
         assert!(!cred.signed());
         assert!(cred.proof_value().is_none());
@@ -2344,44 +2807,33 @@ mod tests {
 
     #[test]
     fn test_helpers() {
-        let cred: DTGCredential = match serde_json::from_str(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "MembershipCredential"],
-                "issuer": "did:example:issuer",
-                "validFrom": "2024-06-18T00:00:00Z",
-                "credentialSubject": { "id": "did:example:subject" }
-            }"#,
-        ) {
-            Ok(vmc) => vmc,
-            Err(e) => panic!("Couldn't deserialize credential: {}", e),
-        };
+        let cred = parse(doc(
+            "MembershipCredential",
+            "public",
+            serde_json::json!({ "id": "did:example:subject" }),
+        ))
+        .unwrap();
 
         assert_eq!(cred.issuer(), "did:example:issuer");
+        assert_eq!(cred.issuer_scope(), IssuerScope::Public);
         assert_eq!(cred.subject(), "did:example:subject");
         assert_eq!(
             cred.valid_from()
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "2024-06-18T00:00:00Z"
+            "2024-06-18T10:00:00Z"
         );
         assert_eq!(cred.valid_until(), None);
     }
 
     #[test]
     fn test_valid_until() {
-        let cred: DTGCredential = match serde_json::from_str(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "MembershipCredential"],
-                "issuer": "did:example:issuer",
-                "validFrom": "2024-06-18T00:00:00Z",
-                "validUntil": "2030-01-01T00:00:00Z",
-                "credentialSubject": { "id": "did:example:subject" }
-            }"#,
-        ) {
-            Ok(vmc) => vmc,
-            Err(e) => panic!("Couldn't deserialize credential: {}", e),
-        };
+        let mut vc = doc(
+            "MembershipCredential",
+            "public",
+            serde_json::json!({ "id": "did:example:subject" }),
+        );
+        vc["validUntil"] = serde_json::json!("2030-01-01T00:00:00Z");
+        let cred = parse(vc).unwrap();
 
         assert_eq!(
             cred.valid_until()
@@ -2393,63 +2845,48 @@ mod tests {
 
     #[test]
     fn test_bad_type() {
-        assert!(
-            std::convert::TryInto::<DTGCredentialType>::try_into(
-                vec!["bad_type".to_string()].as_slice(),
-            )
-            .is_err()
+        assert!(check_type(&["bad_type".to_string()]).is_err());
+    }
+
+    /// A model mutated out of shape is refused by `validate`, so it is never signed.
+    #[test]
+    fn test_badly_constructed_credential_is_refused_by_validate() {
+        let mut cred = DTGCredential::new_vrc(
+            "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
+            "did:example:subject".to_string(),
+            Utc::now(),
+            None,
         );
-    }
+        cred.credential_mut().type_[2] = "StatementCredential".to_string();
+        assert!(cred.validate().is_err());
 
-    #[test]
-    fn test_badly_constructed_vwc() {
-        let mut cred = DTGCommon::default();
-        cred.type_.push("WitnessCredential".to_string());
-        // taskContext is set so this exercises the credentialSubject mismatch, not the
-        // missing-taskContext path covered by test_vwc_missing_task_context()
-        cred.task_context = Some("thread-abc-123".to_string());
-        cred.credential_subject = CredentialSubject::RCard(CredentialSubjectRCard {
-            id: "did:example:bad".to_string(),
-            card: Value::Null,
-        });
-
-        assert!(std::convert::TryInto::<DTGCredential>::try_into(cred).is_err());
-    }
-
-    #[test]
-    fn test_vwc_missing_task_context() {
-        // taskContext is REQUIRED on a VWC
-        match serde_json::from_str::<DTGCredential>(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "WitnessCredential"],
-                "issuer": "did:example:witness",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "credentialSubject": { "id": "did:example:observed" }
-            }"#,
-        ) {
-            Ok(_) => panic!("Expected a VWC without taskContext to be rejected"),
-            Err(e) => assert_eq!(
-                e.to_string(),
-                "WitnessCredential is missing the required taskContext property"
-            ),
-        }
+        let mut vmc = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            Utc::now(),
+            None,
+            false,
+        );
+        vmc.credential_mut().issuer_scope = IssuerScope::Pairwise;
+        assert!(matches!(
+            vmc.validate(),
+            Err(DTGCredentialError::IssuerScopeTooNarrow { .. })
+        ));
     }
 
     #[test]
     fn test_task_context_round_trip() {
         // taskContext must survive deserialize -> serialize, otherwise a credential signed
         // elsewhere would fail verification here (and vice versa)
-        let raw = r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "WitnessCredential"],
-                "issuer": "did:example:witness",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "taskContext": "thread-abc-123",
-                "credentialSubject": { "id": "did:example:observed" }
-            }"#;
+        let mut vc = doc(
+            "RelationshipCredential",
+            "pairwise",
+            serde_json::json!({ "id": "did:example:observed" }),
+        );
+        vc["taskContext"] = serde_json::json!("thread-abc-123");
 
-        let cred: DTGCredential = serde_json::from_str(raw).unwrap();
+        let cred = parse(vc).unwrap();
         let out = serde_json::to_string(&cred).unwrap();
 
         assert!(out.contains(r#""taskContext":"thread-abc-123""#));
@@ -2457,27 +2894,36 @@ mod tests {
 
     #[test]
     fn test_task_context_optional_on_other_types() {
-        // taskContext is OPTIONAL everywhere except the VWC
-        let vrc: DTGCredential = serde_json::from_str(
-            r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
-                "type": ["VerifiableCredential", "DTGCredential",  "RelationshipCredential"],
-                "issuer": "did:example:issuer",
-                "validFrom": "2024-06-18T10:00:00Z",
-                "credentialSubject": { "id": "did:example:subject" }
-            }"#,
-        )
+        // taskContext is OPTIONAL unless a statement's profile requires it
+        let vrc = parse(doc(
+            "RelationshipCredential",
+            "pairwise",
+            serde_json::json!({ "id": "did:example:subject" }),
+        ))
         .unwrap();
 
         assert_eq!(vrc.task_context(), None);
         // and it is omitted from the serialization entirely when absent
         assert!(!serde_json::to_string(&vrc).unwrap().contains("taskContext"));
+
+        let vec = parse(doc(
+            "StatementCredential",
+            "pairwise",
+            serde_json::json!({
+                "id": "did:example:subject",
+                "predicate": ENDORSES_V1,
+                "object": { "value": "a good egg" }
+            }),
+        ))
+        .unwrap();
+        assert_eq!(vec.task_context(), None);
     }
 
     #[test]
     fn test_digest_multibase() {
         let vrc = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:subject".to_string(),
             DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
                 .unwrap()
@@ -2502,6 +2948,7 @@ mod tests {
         // and distinct for a different credential
         let other = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:someone-else".to_string(),
             DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
                 .unwrap()
@@ -2519,27 +2966,36 @@ mod tests {
 
         let vrc = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:subject".to_string(),
             valid_from,
             None,
         );
 
-        let vwc = DTGCredential::new_vwc(
+        let session = serde_json::json!({
+            "id": "urn:uuid:session",
+            "type": "https://trusttasks.org/spec/witness/session/0.1",
+            "threadId": "urn:uuid:session",
+        });
+        let vwc = DTGCredential::new_witnessed_vsc(
             "did:example:witness".to_string(),
-            // the DID of the issuer of the VRC being attested
-            "did:example:issuer".to_string(),
+            IssuerScope::Public,
+            &serde_json::to_value(&vrc).unwrap(),
+            &session,
             valid_from,
             None,
-            "thread-abc-123".to_string(),
-            Some(vrc.digest_multibase().unwrap()),
             None,
-        );
+        )
+        .unwrap();
+        // the DID of the issuer of the VRC being attested
+        assert_eq!(vwc.subject(), "did:example:issuer");
 
         assert!(vwc.verify_digest(&vrc).unwrap());
 
         // a different VRC must not match
         let other = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:someone-else".to_string(),
             valid_from,
             None,
@@ -2555,21 +3011,24 @@ mod tests {
 
         let vrc = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:subject".to_string(),
             valid_from,
             None,
         );
 
-        // digest is OPTIONAL - with none present there is nothing to rely on
-        let vwc = DTGCredential::new_vwc(
-            "did:example:witness".to_string(),
+        // A statement whose object is not a digest references nothing to rely on
+        let vec = DTGCredential::new_endorses_vsc(
+            "did:example:peer".to_string(),
+            IssuerScope::Directed,
             "did:example:issuer".to_string(),
+            serde_json::json!({ "skill": "chess" }),
             valid_from,
             None,
-            "thread-abc-123".to_string(),
-            None,
-            None,
-        );
+        )
+        .unwrap();
+        assert_eq!(vec.subject_digest(), None);
+        let vwc = vec;
 
         assert!(!vwc.verify_digest(&vrc).unwrap());
     }
@@ -2606,9 +3065,9 @@ mod tests {
         // then wrapped per CID v1.0 §2.4-2.5:
         //   {"@context":[...],"credentialSubject":{"id":"did:example:member"},
         //    "id":"urn:uuid:2a4e...","issuer":"did:example:community",
-        //    "type":[...],"validFrom":"2025-12-11T00:00:00Z"}
-        // whose SHA-256 is 49c9d5135ab4b5659a343bc79d351e37d64f05add58408cae6eef022828495c2.
-        assert_eq!(digest, "zQmTJgyPT2ShMQ2AvCHGDoPGjEWyRC7ZNT3MBpe5PP6Vpvu");
+        //    "issuerScope":"public","type":[...],"validFrom":"2025-12-11T00:00:00Z"}
+        // whose SHA-256 is efcb1e1022a5dbfd35af908d18ed7cc20af00cef049bd83d8ff955b97f4d07fe.
+        assert_eq!(digest, "zQmeUhnd33Xp8egdUiQjPCVgANMXKSL7Nt5sCZbkcs2h2A1");
 
         // Stable across calls.
         assert_eq!(digest, vmc.digest_multibase().unwrap());
@@ -2632,7 +3091,7 @@ mod tests {
 
         assert_eq!(
             vmc.digest().unwrap(),
-            "sha256:49c9d5135ab4b5659a343bc79d351e37d64f05add58408cae6eef022828495c2"
+            "sha256:efcb1e1022a5dbfd35af908d18ed7cc20af00cef049bd83d8ff955b97f4d07fe"
         );
     }
 
@@ -2737,6 +3196,7 @@ mod tests {
         let ack = DTGCredential::new_member_vmc_for(
             &wire(&grant),
             "did:example:member",
+            IssuerScope::Directed,
             valid_from,
             None,
         )
@@ -2774,6 +3234,7 @@ mod tests {
         let ack = DTGCredential::new_member_vmc_for(
             &wire(&grant),
             "did:example:member",
+            IssuerScope::Directed,
             valid_from,
             None,
         )
@@ -2815,6 +3276,7 @@ mod tests {
         let ack_of_ack = DTGCredential::new_member_vmc_for(
             &wire(&grant),
             "did:example:member",
+            IssuerScope::Directed,
             valid_from,
             None,
         )
@@ -2848,6 +3310,7 @@ mod tests {
 
         let vdc = DTGCredential::new_vdc(
             "did:example:delegator".to_string(),
+            IssuerScope::Directed,
             "did:example:delegate".to_string(),
             valid_from,
             valid_until,
@@ -2898,6 +3361,7 @@ mod tests {
     fn credential_types_compare_by_equality() {
         let vdc = DTGCredential::new_vdc(
             "did:example:delegator".to_string(),
+            IssuerScope::Directed,
             "did:example:delegate".to_string(),
             Utc::now(),
             Utc::now() + chrono::Duration::days(1),
@@ -3020,8 +3484,14 @@ mod tests {
              verbatim, this test has stopped guarding anything"
         );
 
-        let ack = DTGCredential::new_member_vmc_for(&grant, "did:example:member", valid_from, None)
-            .expect("builds");
+        let ack = DTGCredential::new_member_vmc_for(
+            &grant,
+            "did:example:member",
+            IssuerScope::Directed,
+            valid_from,
+            None,
+        )
+        .expect("builds");
 
         assert_eq!(
             ack.subject_digest(),
@@ -3072,6 +3542,7 @@ mod tests {
         let ack = DTGCredential::new_member_vmc_for(
             &wire(&grant),
             "did:example:member",
+            IssuerScope::Directed,
             valid_from,
             None,
         )
@@ -3079,6 +3550,7 @@ mod tests {
 
         let vrc = DTGCredential::new_vrc(
             "did:example:member".to_string(),
+            IssuerScope::Pairwise,
             "did:example:community".to_string(),
             valid_from,
             None,
@@ -3086,15 +3558,20 @@ mod tests {
         assert!(!ack.acknowledges(&vrc).unwrap());
 
         // And a VWC bound to the grant is a witness attestation, not a member's consent.
-        let vwc = DTGCredential::new_vwc(
+        let vwc = DTGCredential::new_witnessed_vsc(
             "did:example:witness".to_string(),
-            "did:example:community".to_string(),
+            IssuerScope::Public,
+            &wire(&grant),
+            &serde_json::json!({
+                "id": "urn:uuid:session",
+                "type": "https://trusttasks.org/spec/witness/session/0.1",
+                "threadId": "urn:uuid:session",
+            }),
             valid_from,
             None,
-            "thread-abc-123".to_string(),
-            Some(grant.digest_multibase().unwrap()),
             None,
-        );
+        )
+        .unwrap();
         assert!(vwc.verify_digest(&grant).unwrap(), "the digest does match");
         assert!(
             !vwc.acknowledges(&grant).unwrap(),
@@ -3113,12 +3590,19 @@ mod tests {
 
         let vrc = DTGCredential::new_vrc(
             "did:example:a".to_string(),
+            IssuerScope::Pairwise,
             "did:example:b".to_string(),
             valid_from,
             None,
         );
         assert!(matches!(
-            DTGCredential::new_member_vmc_for(&wire(&vrc), "did:example:b", valid_from, None),
+            DTGCredential::new_member_vmc_for(
+                &wire(&vrc),
+                "did:example:b",
+                IssuerScope::Directed,
+                valid_from,
+                None
+            ),
             Err(DTGCredentialError::NotAMembershipGrant(_))
         ));
 
@@ -3132,6 +3616,7 @@ mod tests {
         let ack = DTGCredential::new_member_vmc_for(
             &wire(&grant),
             "did:example:member",
+            IssuerScope::Directed,
             valid_from,
             None,
         )
@@ -3140,24 +3625,24 @@ mod tests {
             DTGCredential::new_member_vmc_for(
                 &wire(&ack),
                 "did:example:community",
+                IssuerScope::Directed,
                 valid_from,
-                None
+                None,
             ),
             Err(DTGCredentialError::NotAMembershipGrant(_))
         ));
     }
 
-    /// `{ id, digest }` is shape-identical to a VWC subject, and the untagged enum matches
-    /// `Witness` first. On a MembershipCredential the credential's `type` is the only thing
-    /// that says otherwise, so the normalization in `TryFrom<DTGCommon>` is what makes this
-    /// deserialize as the member-issued half rather than as a witness attestation.
+    /// `{ id, digestMultibase }` is the member-issued half, and lands on `Membership`
+    /// directly — no other subject shape has a top-level `digestMultibase` to compete for it.
     #[test]
     fn test_member_issued_vmc_deserializes_as_membership_not_witness() {
         let vmc: DTGCredential = serde_json::from_str(
             r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://registry.trustoverip.org/dtg/context/v1"],
                 "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
                 "issuer": "did:example:member",
+                "issuerScope": "directed",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": {
                     "id": "did:example:community",
@@ -3179,15 +3664,16 @@ mod tests {
         assert_eq!(vmc.subject(), "did:example:community");
     }
 
-    /// `witnessContext` belongs to a VWC. A VMC carrying one is malformed rather than
-    /// merely surprising, and is refused instead of being silently read as a grant.
+    /// `witnessContext` belongs to a `witnessed/1` statement. A VMC carrying one is malformed
+    /// rather than merely surprising, and is refused instead of being silently read as a grant.
     #[test]
     fn test_membership_credential_rejects_a_witness_context() {
         let result: Result<DTGCredential, _> = serde_json::from_str(
             r#"{
-                "@context": ["https://www.w3.org/ns/credentials/v2"],
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://registry.trustoverip.org/dtg/context/v1"],
                 "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
                 "issuer": "did:example:member",
+                "issuerScope": "public",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": {
                     "id": "did:example:community",
@@ -3217,6 +3703,7 @@ mod tests {
         let ack = DTGCredential::new_member_vmc_for(
             &wire(&grant),
             "did:example:member",
+            IssuerScope::Directed,
             valid_from,
             None,
         )
@@ -3250,17 +3737,21 @@ mod tests {
         )
         .unwrap()
         .to_utc();
-        let cred = DTGCommon {
-            valid_until: Some(now),
-            ..Default::default()
+        let vrc = |valid_until| {
+            DTGCredential::new_vrc(
+                "did:example:issuer".to_string(),
+                IssuerScope::Pairwise,
+                "did:example:subject".to_string(),
+                now,
+                valid_until,
+            )
         };
 
-        let value = serde_json::to_value(&cred).unwrap();
+        let value = serde_json::to_value(vrc(Some(now + chrono::Duration::days(1)))).unwrap();
         let cred2: DTGCommon = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(cred2.valid_until, Some(now));
+        assert_eq!(cred2.valid_until, Some(now + chrono::Duration::days(1)));
 
-        let cred = DTGCommon::default();
-        let value = serde_json::to_value(&cred).unwrap();
+        let value = serde_json::to_value(vrc(None)).unwrap();
         let cred2: DTGCommon = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(cred2.valid_until, None);
     }
@@ -3274,6 +3765,7 @@ mod tests {
 
         let mut cred = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:subject".to_string(),
             Utc::now(),
             None,
@@ -3309,6 +3801,7 @@ mod tests {
 
         let mut cred = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:subject".to_string(),
             Utc::now(),
             None,
@@ -3343,6 +3836,7 @@ mod tests {
 
         let mut cred = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:subject".to_string(),
             Utc::now(),
             None,
@@ -3359,6 +3853,7 @@ mod tests {
 
         let cred = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:subject".to_string(),
             Utc::now(),
             None,
@@ -3425,8 +3920,9 @@ mod tests {
             DTGCredential::new_member_vmc_for(
                 &wire(&grant),
                 "did:example:member",
+                IssuerScope::Directed,
                 from,
-                Some(from - chrono::Duration::hours(1))
+                Some(from - chrono::Duration::hours(1)),
             ),
             Err(DTGCredentialError::InvalidValidityWindow { .. })
         ));
@@ -3442,6 +3938,7 @@ mod tests {
         let secret = Secret::generate_ed25519(None, None);
         let mut vrc = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
+            IssuerScope::Pairwise,
             "did:example:subject".to_string(),
             Utc::now(),
             Some(Utc::now() - chrono::Duration::days(1)),

@@ -1,6 +1,6 @@
 //! Bounds on the open JSON a credential carries.
 //!
-//! Some members of a DTG credential are arbitrary JSON: a VEC's `endorsement`,
+//! Some members of a DTG credential are arbitrary JSON: a VSC's `object.value`,
 //! `credentialStatus`, and any top-level member this library does not model. Digesting,
 //! signing and verifying all walk those values recursively, so a value nested deeply enough
 //! exhausts the stack — and a stack overflow aborts the process rather than returning an
@@ -12,7 +12,10 @@
 //! why these tests are a binary of their own.
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use dtg_credentials::{DTGCredential, DTGCredentialError, MAX_JSON_DEPTH, digest_multibase_json};
+use dtg_credentials::{
+    DTGCredential, DTGCredentialError, IssuerScope, MAX_JSON_DEPTH, StatementObject,
+    digest_multibase_json,
+};
 use serde_json::{Value, json};
 
 /// Small enough that recursively cloning or canonicalizing a value [`OVER_DEEP`] levels deep
@@ -44,10 +47,40 @@ fn deep(depth: usize) -> Value {
     value
 }
 
-/// A VEC carrying `endorsement`, which sits at depth 3 of the document: the credential,
-/// then `credentialSubject`, then the member itself.
+/// A VEC carrying `endorsement` as `object.value`, which sits at depth 4 of the document:
+/// the credential, then `credentialSubject`, then `object`, then the value itself.
+///
+/// Built shallow and filled in afterwards, because the constructor refuses a value past the
+/// bound and these tests need one that got in anyway.
 fn endorsing(endorsement: Value) -> DTGCredential {
-    DTGCredential::new_vec(ISSUER.into(), SUBJECT.into(), t0(), None, endorsement)
+    let mut vec = DTGCredential::new_endorses_vsc(
+        ISSUER.into(),
+        IssuerScope::Directed,
+        SUBJECT.into(),
+        Value::Null,
+        t0(),
+        None,
+    )
+    .expect("a shallow endorsement");
+    vec.credential_mut().statement_mut().unwrap().object = StatementObject::Value(endorsement);
+    vec
+}
+
+/// The constructor refuses a value past the bound itself, since it can return an error.
+#[test]
+fn the_constructor_refuses_a_deep_endorsement() {
+    let refused = on_a_small_stack(|| {
+        DTGCredential::new_endorses_vsc(
+            ISSUER.into(),
+            IssuerScope::Directed,
+            SUBJECT.into(),
+            deep(OVER_DEEP),
+            t0(),
+            None,
+        )
+        .map(|_| ())
+    });
+    assert!(is_too_deep(&refused));
 }
 
 /// Runs `f` on a thread with [`SMALL_STACK`]. An overflow aborts the whole binary, which is
@@ -71,11 +104,11 @@ fn is_too_deep<T: std::fmt::Debug>(result: &Result<T, DTGCredentialError>) -> bo
 
 #[test]
 fn an_endorsement_within_the_bound_is_digested() {
-    endorsing(deep(MAX_JSON_DEPTH - 3))
+    endorsing(deep(MAX_JSON_DEPTH - 4))
         .digest_multibase()
         .expect("comfortably within the bound");
 
-    let at_the_bound = endorsing(deep(MAX_JSON_DEPTH - 2));
+    let at_the_bound = endorsing(deep(MAX_JSON_DEPTH - 3));
     at_the_bound
         .validate()
         .expect("a document exactly at the bound is accepted");
@@ -84,11 +117,11 @@ fn an_endorsement_within_the_bound_is_digested() {
         .expect("a document exactly at the bound is digested");
 }
 
-/// The bound is on the document, not on the member: two levels of envelope sit above an
+/// The bound is on the document, not on the member: three levels of envelope sit above an
 /// endorsement, so one level more than that crosses it.
 #[test]
 fn the_bound_counts_from_the_top_of_the_credential() {
-    let vec = endorsing(deep(MAX_JSON_DEPTH - 1));
+    let vec = endorsing(deep(MAX_JSON_DEPTH - 2));
 
     assert!(is_too_deep(&vec.validate()));
     assert!(is_too_deep(&vec.digest_multibase()));
@@ -111,6 +144,7 @@ fn an_endorsement_beyond_the_bound_is_refused() {
 fn a_credential_status_beyond_the_bound_is_refused() {
     let vdc = DTGCredential::new_vdc(
         ISSUER.into(),
+        IssuerScope::Directed,
         SUBJECT.into(),
         t0(),
         t0() + Duration::days(1),
@@ -175,6 +209,7 @@ fn deriving_from_a_deep_parent_is_refused_without_exhausting_the_stack() {
     let mut vac = serde_json::to_value(
         DTGCredential::new_vac(
             ISSUER.into(),
+            IssuerScope::Public,
             SUBJECT.into(),
             ISSUER.into(),
             vec!["read".into()],
@@ -189,6 +224,7 @@ fn deriving_from_a_deep_parent_is_refused_without_exhausting_the_stack() {
     let mut vdc = serde_json::to_value(
         DTGCredential::new_vdc(
             ISSUER.into(),
+            IssuerScope::Directed,
             SUBJECT.into(),
             t0(),
             t0() + Duration::days(1),
@@ -203,13 +239,16 @@ fn deriving_from_a_deep_parent_is_refused_without_exhausting_the_stack() {
     let (attenuated, redelegated, vac, vdc) = on_a_small_stack(move || {
         let attenuated = DTGCredential::attenuate_from_json(
             &vac,
+            IssuerScope::Directed,
             "did:example:agent".into(),
             vec!["read".into()],
             t0(),
             t0() + Duration::hours(1),
+            None,
         );
         let redelegated = DTGCredential::redelegate_from_json(
             &vdc,
+            IssuerScope::Directed,
             "did:example:agent".into(),
             vec!["sign:invoices".into()],
             t0(),
@@ -244,6 +283,7 @@ fn answering_a_deep_grant_is_refused_without_exhausting_the_stack() {
     let mut delegation = serde_json::to_value(
         DTGCredential::new_vdc(
             ISSUER.into(),
+            IssuerScope::Directed,
             SUBJECT.into(),
             t0(),
             until,
@@ -258,9 +298,20 @@ fn answering_a_deep_grant_is_refused_without_exhausting_the_stack() {
     // The subject of each grant answers its own grant, so the member check passes and the
     // digest is reached.
     let (acknowledged, accepted, membership, delegation) = on_a_small_stack(move || {
-        let acknowledged =
-            DTGCredential::new_member_vmc_for(&membership, SUBJECT, t0(), Some(until));
-        let accepted = DTGCredential::new_delegate_vdc_for(&delegation, SUBJECT, t0(), until);
+        let acknowledged = DTGCredential::new_member_vmc_for(
+            &membership,
+            SUBJECT,
+            IssuerScope::Directed,
+            t0(),
+            Some(until),
+        );
+        let accepted = DTGCredential::new_delegate_vdc_for(
+            &delegation,
+            SUBJECT,
+            IssuerScope::Directed,
+            t0(),
+            until,
+        );
         (acknowledged, accepted, membership, delegation)
     });
 
@@ -288,7 +339,7 @@ fn serde_json_still_limits_parsing_depth() {
 /// Anything within the bound survives the trip a verifier puts it through.
 #[test]
 fn a_credential_at_the_bound_parses_back() {
-    let vec = endorsing(deep(MAX_JSON_DEPTH - 2));
+    let vec = endorsing(deep(MAX_JSON_DEPTH - 3));
     vec.validate().expect("at the bound");
 
     let back: DTGCredential =
@@ -315,7 +366,7 @@ fn open_members_are_carried_verbatim_within_the_bound() {
     vec.validate().expect("shallow, however large");
 
     let wire = serde_json::to_value(&vec).unwrap();
-    assert_eq!(wire["credentialSubject"]["endorsement"], endorsement);
+    assert_eq!(wire["credentialSubject"]["object"]["value"], endorsement);
 }
 
 #[cfg(feature = "affinidi-signing")]

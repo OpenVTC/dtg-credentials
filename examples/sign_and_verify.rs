@@ -13,7 +13,7 @@ use affinidi_tdk::{
 };
 use anyhow::Result;
 use chrono::Utc;
-use dtg_credentials::DTGCredential;
+use dtg_credentials::{DTGCredential, IssuerScope};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
     // Create a Persona Credential (VPC)
     let mut vpc = DTGCredential::new_vpc(
         issuer_did.clone(),
+        IssuerScope::Directed,
         "did:example:subject".to_string(),
         Utc::now(),
         None,

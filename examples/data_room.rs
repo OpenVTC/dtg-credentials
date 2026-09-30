@@ -50,7 +50,7 @@ use chacha20poly1305::{
 };
 use chrono::{Duration, Utc};
 use dtg_credentials::{
-    DTGCredential, authority::verify_chain, delegation, verify_grant_with_public_key,
+    DTGCredential, IssuerScope, authority::verify_chain, delegation, verify_grant_with_public_key,
 };
 use rand::Rng;
 
@@ -205,6 +205,7 @@ async fn main() -> Result<()> {
     // controls it, which is what makes her the owner — there is no separate owner record.
     let mut alice_vac = DTGCredential::new_vac(
         room_did.clone(),
+        IssuerScope::Public,
         alice_did.clone(),
         room_did.clone(),
         vec![
@@ -227,6 +228,7 @@ async fn main() -> Result<()> {
     // never touches the host — which is why the host below never sees it.
     let mut vic = DTGCredential::new_vic(
         room_did.clone(),
+        IssuerScope::Public,
         bob_did.clone(),
         now,
         Some(now + Duration::days(7)),
@@ -257,6 +259,7 @@ async fn main() -> Result<()> {
     let mut ack = DTGCredential::new_member_vmc_for(
         &grant_wire,
         &bob_did,
+        IssuerScope::Directed,
         now,
         Some(now + Duration::days(30)),
     )?;
@@ -264,6 +267,7 @@ async fn main() -> Result<()> {
 
     let mut bob_vac = DTGCredential::new_vac(
         room_did.clone(),
+        IssuerScope::Public,
         bob_did.clone(),
         room_did.clone(),
         vec!["read".into(), "write".into()],
@@ -303,10 +307,12 @@ async fn main() -> Result<()> {
     // The case the VAC exists for.
     let mut agent_vac = bob_vac
         .attenuate(
+            IssuerScope::Directed,
             agent_did.clone(),
             vec!["read".into()],
             now,
             now + Duration::hours(4),
+            None,
         )?
         .with_id("urn:uuid:vac-agent");
     agent_vac.sign(&bob_secret, None).await?;
@@ -351,6 +357,7 @@ async fn main() -> Result<()> {
     // representation, and no amount of authority expresses it.
     let mut appointment = DTGCredential::new_vdc(
         bob_did.clone(),
+        IssuerScope::Directed,
         scheduler_did.clone(),
         now,
         now + Duration::days(30),
@@ -370,6 +377,7 @@ async fn main() -> Result<()> {
     let mut acceptance = DTGCredential::new_delegate_vdc_for(
         &grant_json,
         &scheduler_did,
+        IssuerScope::Directed,
         now,
         now + Duration::days(30),
     )?

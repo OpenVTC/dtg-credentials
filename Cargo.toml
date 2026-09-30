@@ -26,6 +26,8 @@ serde_json_canonicalizer = "0.3"
 sha2 = "0.11"
 thiserror = "2.0"
 tracing = "0.1"
+# NFC check on VSC predicate IRIs, which are compared byte for byte and never normalized.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 affinidi-tdk = "0.16"

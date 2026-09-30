@@ -1,8 +1,9 @@
 //! Citing a trust task: `taskContext` names the exchange, `taskDigestMultibase` binds to it.
 //!
-//! A VWC issued through `witness/session` + `witness/session/submit` MUST carry both, and
-//! the digest MUST be the *task digest* of the `witness/session` document (Trust Tasks
-//! §4.9.3): JCS over the document with its top-level `proof` removed, sha2-256, multibase.
+//! A VWC — a statement under `witnessed/1` — issued through `witness/session` +
+//! `witness/session/submit` MUST carry both, and the digest MUST be the *task digest* of the
+//! `witness/session` document (Trust Tasks §4.9.3): JCS over the document with its top-level
+//! `proof` removed, sha2-256, multibase.
 //!
 //! The vector at the top is not ours. It is the `vetting/session/0.1` example printed in
 //! dtgwg-trust-tasks-tf (`specs/vetting/session/0.1/spec.md`, at 5442e97), whose Vetting
@@ -12,8 +13,8 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use dtg_credentials::{
-    DTGCredential, DTGCredentialError, DTGCredentialType, WitnessContext, digest_multibase_json,
-    task_digest_multibase_json,
+    DTGCredential, DTGCredentialError, DTGCredentialType, IssuerScope, VETTED_V1, WITNESSED_V1,
+    WitnessContext, digest_multibase_json, task_digest_multibase_json,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256, Sha512};
@@ -50,7 +51,10 @@ const VETTING_SESSION: &str = r#"{
 const VETTING_SESSION_TASK_DIGEST: &str = "zQmWAWEtpUqE3xd3LUpZ8GryGrZMCqH1A5D7bZcayvEfJTK";
 
 /// The Vetting Statement from the same example: a DTG credential carrying
-/// `taskContext` and `taskDigestMultibase` at the top level.
+/// `taskContext` and `taskDigestMultibase` at the top level. It predates the Implementers
+/// Draft — the retired `EndorsementCredential` type under the pre-v1 context, with no
+/// `issuerScope` — so it is kept to show that it is refused, and its payload is reissued as
+/// a `vetted/1` statement below.
 const VETTING_STATEMENT: &str = r#"{
   "@context": ["https://www.w3.org/ns/credentials/v2", "https://firstperson.network/credentials/dtg/v1"],
   "id": "urn:uuid:7e5d3c1b-9f8a-4b6c-a2d1-e0f9a8b7c601",
@@ -81,7 +85,6 @@ const WITNESS: &str = "did:webvh:QmWitnessScid:witness.example";
 const ALICE: &str = "did:peer:2.alice-relationship";
 const BOB: &str = "did:peer:2.bob-relationship";
 const SESSION_ID: &str = "urn:uuid:0b6f9e2a-4c1d-4e7b-9a3f-5d2c8e1f7a01";
-const EDGE_DIGEST: &str = "zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n";
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 22, 10, 0, 0).unwrap()
@@ -101,14 +104,26 @@ fn witness_session() -> Value {
     })
 }
 
-fn vwc_for(session: &Value) -> Result<DTGCredential, DTGCredentialError> {
-    DTGCredential::new_vwc_for_session(
-        WITNESS.into(),
+/// Alice's half of the relationship edge the witness observes her issue.
+fn alices_vrc() -> Value {
+    serde_json::to_value(DTGCredential::new_vrc(
         ALICE.into(),
+        IssuerScope::Pairwise,
+        BOB.into(),
         t0(),
         None,
+    ))
+    .unwrap()
+}
+
+fn vwc_for(session: &Value) -> Result<DTGCredential, DTGCredentialError> {
+    DTGCredential::new_witnessed_vsc(
+        WITNESS.into(),
+        IssuerScope::Public,
+        &alices_vrc(),
         session,
-        EDGE_DIGEST.into(),
+        t0(),
+        None,
         Some(WitnessContext {
             event: None,
             session_id: Some(SESSION_ID.into()),
@@ -197,13 +212,18 @@ fn a_session_vwc_carries_both_halves_of_the_citation() {
     let session = witness_session();
     let vwc = vwc_for(&session).unwrap();
 
-    assert_eq!(vwc.type_(), DTGCredentialType::Witness);
+    assert_eq!(vwc.type_(), DTGCredentialType::Statement);
+    assert_eq!(vwc.predicate(), Some(WITNESSED_V1));
+    assert_eq!(vwc.subject(), ALICE, "the party observed issuing the edge");
     assert_eq!(vwc.task_context(), Some(SESSION_ID));
     assert_eq!(
         vwc.task_digest_multibase(),
         Some(task_digest_multibase_json(&session).unwrap().as_str())
     );
-    assert_eq!(vwc.subject_digest(), Some(EDGE_DIGEST));
+    assert_eq!(
+        vwc.subject_digest(),
+        Some(digest_multibase_json(&alices_vrc()).unwrap().as_str())
+    );
 
     let wire = serde_json::to_value(&vwc).unwrap();
     assert_eq!(wire["taskContext"], json!(SESSION_ID));
@@ -227,7 +247,7 @@ fn a_session_vwc_round_trips_and_still_cites_its_session() {
     let text = serde_json::to_string(&vwc).unwrap();
     let parsed: DTGCredential = serde_json::from_str(&text).unwrap();
 
-    assert_eq!(parsed.type_(), DTGCredentialType::Witness);
+    assert_eq!(parsed.type_(), DTGCredentialType::Statement);
     assert_eq!(parsed.task_context(), vwc.task_context());
     assert_eq!(parsed.task_digest_multibase(), vwc.task_digest_multibase());
     assert!(parsed.cites_task(&session).unwrap());
@@ -318,13 +338,13 @@ fn a_session_without_an_id_cannot_be_cited() {
 
 #[test]
 fn an_inverted_window_is_refused_before_the_session_is_read() {
-    let refused = DTGCredential::new_vwc_for_session(
+    let refused = DTGCredential::new_witnessed_vsc(
         WITNESS.into(),
-        ALICE.into(),
+        IssuerScope::Public,
+        &json!(null),
+        &json!(null),
         t0(),
         Some(t0() - chrono::Duration::hours(1)),
-        &json!(null),
-        EDGE_DIGEST.into(),
         None,
     );
     assert!(matches!(
@@ -363,49 +383,71 @@ fn a_different_document_is_not_cited_even_with_a_matching_digest() {
 #[test]
 fn a_credential_with_no_task_digest_cites_nothing() {
     let session = witness_session();
-    #[allow(deprecated)]
-    let legacy = DTGCredential::new_vwc(
-        WITNESS.into(),
+    let mut vwc = vwc_for(&session).unwrap();
+    vwc.credential_mut().task_digest_multibase = None;
+
+    assert_eq!(vwc.task_context(), Some(SESSION_ID));
+    assert!(!vwc.cites_task(&session).unwrap());
+}
+
+/// `witnessed/1` makes the digest REQUIRED beside `taskContext`, so a VWC naming its session
+/// by `id` alone — the shape every pre-0.11 VWC had — is refused at parse.
+#[test]
+fn a_vwc_without_task_digest_is_refused() {
+    let mut wire = serde_json::to_value(vwc_for(&witness_session()).unwrap()).unwrap();
+    wire.as_object_mut().unwrap().remove("taskDigestMultibase");
+    assert!(serde_json::from_value::<DTGCredential>(wire).is_err());
+}
+
+/// The witness must be recognizable to both parties and to the community.
+#[test]
+fn a_pairwise_witness_is_refused() {
+    assert!(matches!(
+        DTGCredential::new_witnessed_vsc(
+            WITNESS.into(),
+            IssuerScope::Pairwise,
+            &alices_vrc(),
+            &witness_session(),
+            t0(),
+            None,
+            None,
+        ),
+        Err(DTGCredentialError::IssuerScopeTooNarrow { .. })
+    ));
+}
+
+/// The subject–object rule: the subject is the issuer of the credential the object names,
+/// and a verifier holding that credential checks it.
+#[test]
+fn a_vwc_names_the_issuer_of_the_edge_it_witnessed() {
+    let vwc = vwc_for(&witness_session()).unwrap();
+    assert!(vwc.witnesses_issuance_of(&alices_vrc()).unwrap());
+
+    // Bob's half of the edge is a different credential.
+    let bobs_vrc = serde_json::to_value(DTGCredential::new_vrc(
+        BOB.into(),
+        IssuerScope::Pairwise,
         ALICE.into(),
         t0(),
         None,
-        SESSION_ID.into(),
-        Some(EDGE_DIGEST.into()),
-        None,
-    );
-
-    assert_eq!(legacy.task_context(), Some(SESSION_ID));
-    assert_eq!(legacy.task_digest_multibase(), None);
-    assert!(!legacy.cites_task(&session).unwrap());
-}
-
-/// A VWC issued before the member existed still parses; it just cites nothing.
-#[test]
-fn a_vwc_without_task_digest_still_deserializes() {
-    let parsed: DTGCredential = serde_json::from_value(json!({
-        "@context": ["https://www.w3.org/ns/credentials/v2", "https://firstperson.network/credentials/dtg/v1"],
-        "type": ["VerifiableCredential", "DTGCredential", "WitnessCredential"],
-        "issuer": WITNESS,
-        "validFrom": "2026-09-22T10:00:00Z",
-        "taskContext": SESSION_ID,
-        "credentialSubject": { "id": ALICE, "digestMultibase": EDGE_DIGEST }
-    }))
+    ))
     .unwrap();
-    assert_eq!(parsed.task_digest_multibase(), None);
+    assert!(!vwc.witnesses_issuance_of(&bobs_vrc).unwrap());
+
+    // A VWC whose subject was rewritten to name the other party no longer holds.
+    let mut misdirected = vwc.clone();
+    misdirected.credential_mut().statement_mut().unwrap().id = BOB.into();
+    assert!(!misdirected.witnesses_issuance_of(&alices_vrc()).unwrap());
+
+    // And it is not a statement that Alice *presented* the credential.
+    assert!(!vwc.witnesses_presentation_of(&alices_vrc()).unwrap());
 }
 
 #[test]
 fn a_non_string_task_digest_is_refused_at_parse() {
-    let parsed = serde_json::from_value::<DTGCredential>(json!({
-        "@context": ["https://www.w3.org/ns/credentials/v2", "https://firstperson.network/credentials/dtg/v1"],
-        "type": ["VerifiableCredential", "DTGCredential", "WitnessCredential"],
-        "issuer": WITNESS,
-        "validFrom": "2026-09-22T10:00:00Z",
-        "taskContext": SESSION_ID,
-        "taskDigestMultibase": { "not": "a string" },
-        "credentialSubject": { "id": ALICE, "digestMultibase": EDGE_DIGEST }
-    }));
-    assert!(parsed.is_err());
+    let mut wire = serde_json::to_value(vwc_for(&witness_session()).unwrap()).unwrap();
+    wire["taskDigestMultibase"] = json!({ "not": "a string" });
+    assert!(serde_json::from_value::<DTGCredential>(wire).is_err());
 }
 
 /// §4.9.3 and DTG Core Credentials §Digest Encoding: compare decoded bytes. A base64url
@@ -449,35 +491,42 @@ fn an_unimplemented_hash_leaves_the_citation_unverified() {
 // ---------------------------------------------------------------------------------------
 // Another specification's credential
 
-/// The published Vetting Statement parses, models its `taskDigestMultibase`, and cites the
-/// published session document — a second implementation's credential verified here.
+/// The published Vetting Statement predates the Implementers Draft, and is refused rather
+/// than read under a legacy alias.
 #[test]
-fn the_published_vetting_statement_cites_its_session() {
-    let session: Value = serde_json::from_str(VETTING_SESSION).unwrap();
-    let statement: DTGCredential = serde_json::from_str(VETTING_STATEMENT).unwrap();
+fn the_published_pre_id_vetting_statement_is_refused() {
+    let err = serde_json::from_str::<DTGCredential>(VETTING_STATEMENT).unwrap_err();
+    assert!(err.to_string().contains("context"), "{err}");
 
-    assert_eq!(statement.type_(), DTGCredentialType::Endorsement);
-    assert_eq!(
-        statement.task_digest_multibase(),
-        Some(VETTING_SESSION_TASK_DIGEST)
-    );
-    assert!(statement.cites_task(&session).unwrap());
+    // Even with the v1 context and a declared scope, its type is retired.
+    let mut upgraded: Value = serde_json::from_str(VETTING_STATEMENT).unwrap();
+    upgraded["@context"][1] = json!("https://registry.trustoverip.org/dtg/context/v1");
+    upgraded["issuerScope"] = json!("directed");
+    let err = serde_json::from_value::<DTGCredential>(upgraded).unwrap_err();
+    assert!(err.to_string().contains("EndorsementCredential"), "{err}");
 }
 
-/// `with_task_citation` sets both halves from one document, for any credential type.
+/// The same payload reissued as a `vetted/1` statement reproduces the published citation:
+/// `taskContext` and `taskDigestMultibase` are read from the session document.
 #[test]
-fn with_task_citation_reproduces_the_published_statement_citation() {
+fn a_vetted_statement_reproduces_the_published_citation() {
     let session: Value = serde_json::from_str(VETTING_SESSION).unwrap();
-    let statement = DTGCredential::new_vec(
+    let published: Value = serde_json::from_str(VETTING_STATEMENT).unwrap();
+    let mut vetting = published["credentialSubject"]["endorsement"].clone();
+    vetting.as_object_mut().unwrap().remove("type");
+
+    let statement = DTGCredential::new_vetted_vsc(
         "did:webvh:QmCarolScid1:kernel-vtc.example:carol".into(),
+        IssuerScope::Directed,
         "did:webvh:QmAliceScid1:alice.example".into(),
+        vetting.clone(),
+        &session,
         t0(),
         None,
-        json!({ "type": "https://firstperson.network/endorsements/identity-vetting/0.1" }),
     )
-    .with_task_citation(&session)
     .unwrap();
 
+    assert_eq!(statement.predicate(), Some(VETTED_V1));
     assert_eq!(
         statement.task_context(),
         Some("urn:uuid:9a7e4c21-5b3d-4e8f-a1c2-3d4e5f6a7b01")
@@ -486,4 +535,69 @@ fn with_task_citation_reproduces_the_published_statement_citation() {
         statement.task_digest_multibase(),
         Some(VETTING_SESSION_TASK_DIGEST)
     );
+    assert!(statement.cites_task(&session).unwrap());
+    assert_eq!(
+        statement.statement().unwrap().object.value(),
+        Some(&vetting)
+    );
+
+    // And it survives the trip a verifier puts it through.
+    let back: DTGCredential =
+        serde_json::from_str(&serde_json::to_string(&statement).unwrap()).unwrap();
+    assert!(back.cites_task(&session).unwrap());
+}
+
+/// `vetted/1` requires the citation and a scope of at least `directed`.
+#[test]
+fn a_vetted_statement_needs_its_session_and_a_recognizable_vetter() {
+    let session: Value = serde_json::from_str(VETTING_SESSION).unwrap();
+    assert!(matches!(
+        DTGCredential::new_vetted_vsc(
+            "did:example:vetter".into(),
+            IssuerScope::Pairwise,
+            "did:example:applicant".into(),
+            json!({}),
+            &session,
+            t0(),
+            None,
+        ),
+        Err(DTGCredentialError::IssuerScopeTooNarrow { .. })
+    ));
+    assert!(matches!(
+        DTGCredential::new_vetted_vsc(
+            "did:example:vetter".into(),
+            IssuerScope::Directed,
+            "did:example:applicant".into(),
+            json!({}),
+            &json!({ "no": "id" }),
+            t0(),
+            None,
+        ),
+        Err(DTGCredentialError::MalformedTaskDocument(_))
+    ));
+}
+
+/// `presented/1`: the subject is the *holder* of the credential the object names.
+#[test]
+fn a_presented_statement_names_the_holder() {
+    let session: Value = serde_json::from_str(VETTING_SESSION).unwrap();
+    let vrc = alices_vrc();
+    let statement = DTGCredential::new_presented_vsc(
+        WITNESS.into(),
+        IssuerScope::Directed,
+        &vrc,
+        &session,
+        t0(),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        statement.subject(),
+        BOB,
+        "the VRC's subject, not its issuer"
+    );
+    assert!(statement.witnesses_presentation_of(&vrc).unwrap());
+    assert!(!statement.witnesses_issuance_of(&vrc).unwrap());
+    assert!(statement.cites_task(&session).unwrap());
 }

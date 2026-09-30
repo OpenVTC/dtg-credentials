@@ -9,7 +9,7 @@
 
 use chrono::{Duration, TimeZone, Utc};
 use dtg_credentials::authority::{AuthorityError, MAX_CHAIN_DEPTH, verify_chain};
-use dtg_credentials::{DTGCredential, DTGCredentialError, DTGCredentialType};
+use dtg_credentials::{DTGCredential, DTGCredentialError, DTGCredentialType, IssuerScope};
 
 const ROOM: &str = "did:webvh:zroom:example.com:rooms:7f3a";
 const BOB: &str = "did:key:zBob";
@@ -24,6 +24,7 @@ fn t(h: i64) -> chrono::DateTime<Utc> {
 fn root_grant() -> DTGCredential {
     DTGCredential::new_vac(
         ROOM.into(),
+        IssuerScope::Public,
         BOB.into(),
         ROOM.into(),
         vec!["read".into(), "write".into(), "curate".into()],
@@ -38,7 +39,14 @@ fn root_grant() -> DTGCredential {
 /// the whole of the binding: only the agent can present what only the agent is granted.
 fn agent_grant(parent: &DTGCredential) -> DTGCredential {
     parent
-        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(4))
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(4),
+            None,
+        )
         .expect("attenuation")
         .with_id("urn:uuid:agent-0001")
 }
@@ -49,6 +57,7 @@ fn agent_grant(parent: &DTGCredential) -> DTGCredential {
 fn an_inverted_window_is_refused_at_issue() {
     let inverted = DTGCredential::new_vac(
         ROOM.into(),
+        IssuerScope::Public,
         BOB.into(),
         ROOM.into(),
         vec!["read".into()],
@@ -64,6 +73,7 @@ fn an_inverted_window_is_refused_at_issue() {
     // An empty window is no better: `validUntil` must be strictly after `validFrom`.
     let empty = DTGCredential::new_vac(
         ROOM.into(),
+        IssuerScope::Public,
         BOB.into(),
         ROOM.into(),
         vec!["read".into()],
@@ -79,7 +89,14 @@ fn an_inverted_window_is_refused_at_issue() {
     // Nor may attenuation produce one, even inside the parent's window.
     let root = root_grant();
     let err = root
-        .attenuate(AGENT.into(), vec!["read".into()], t(4), t(2))
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(4),
+            t(2),
+            None,
+        )
         .unwrap_err();
     assert!(
         matches!(err, DTGCredentialError::InvalidValidityWindow { .. }),
@@ -88,10 +105,12 @@ fn an_inverted_window_is_refused_at_issue() {
 
     let err = DTGCredential::attenuate_from_json(
         &serde_json::to_value(&root).unwrap(),
+        IssuerScope::Directed,
         AGENT.into(),
         vec!["read".into()],
         t(4),
         t(4),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -106,6 +125,7 @@ fn an_inverted_window_is_refused_at_issue() {
 fn a_backdated_window_is_accepted_at_issue() {
     DTGCredential::new_vac(
         ROOM.into(),
+        IssuerScope::Public,
         BOB.into(),
         ROOM.into(),
         vec!["read".into()],
@@ -121,6 +141,7 @@ fn a_backdated_window_is_accepted_at_issue() {
 fn a_window_narrower_than_a_second_is_refused() {
     let err = DTGCredential::new_vac(
         ROOM.into(),
+        IssuerScope::Public,
         BOB.into(),
         ROOM.into(),
         vec!["read".into()],
@@ -176,6 +197,7 @@ fn an_attenuated_agent_credential_verifies_for_its_narrower_grant() {
 fn a_self_issued_grant_is_refused_however_well_formed() {
     let forged = DTGCredential::new_vac(
         MALLORY.into(),
+        IssuerScope::Public,
         MALLORY.into(),
         ROOM.into(),
         vec!["read".into(), "write".into(), "curate".into()],
@@ -196,6 +218,7 @@ fn a_self_issued_grant_is_refused_however_well_formed() {
 fn attenuation_cannot_add_an_action_the_parent_lacks() {
     let root = DTGCredential::new_vac(
         ROOM.into(),
+        IssuerScope::Public,
         BOB.into(),
         ROOM.into(),
         vec!["read".into()],
@@ -207,7 +230,14 @@ fn attenuation_cannot_add_an_action_the_parent_lacks() {
 
     // Refused at issue time...
     let err = root
-        .attenuate(AGENT.into(), vec!["write".into()], t(0), t(4))
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["write".into()],
+            t(0),
+            t(4),
+            None,
+        )
         .unwrap_err();
     assert!(
         format!("{err}").contains("not conferred by the parent"),
@@ -218,6 +248,7 @@ fn attenuation_cannot_add_an_action_the_parent_lacks() {
     // hand. The verifier's check is the authoritative one.
     let widened = DTGCredential::new_vac(
         BOB.into(),
+        IssuerScope::Public,
         AGENT.into(),
         ROOM.into(),
         vec!["write".into()],
@@ -245,7 +276,14 @@ fn attenuation_cannot_add_an_action_the_parent_lacks() {
 fn attenuation_cannot_outlive_its_parent() {
     let root = root_grant();
     let err = root
-        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(24 * 365))
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(24 * 365),
+            None,
+        )
         .unwrap_err();
     assert!(format!("{err}").contains("beyond the parent's"), "{err}");
 }
@@ -256,7 +294,9 @@ fn attenuation_cannot_outlive_its_parent() {
 fn a_link_issued_by_someone_other_than_the_parents_subject_is_refused() {
     let root = root_grant(); // granted to BOB
     let grafted = DTGCredential::new_vac(
-        MALLORY.into(), // not BOB
+        MALLORY.into(),
+        IssuerScope::Public,
+        // not BOB
         MALLORY.into(),
         ROOM.into(),
         vec!["read".into()],
@@ -371,8 +411,16 @@ fn an_empty_chain_confers_nothing() {
 /// Emptiness is never a wildcard — the failure mode this rule exists to prevent.
 #[test]
 fn a_vac_conferring_no_actions_is_refused_at_construction() {
-    let err = DTGCredential::new_vac(ROOM.into(), BOB.into(), ROOM.into(), vec![], t(0), t(1))
-        .unwrap_err();
+    let err = DTGCredential::new_vac(
+        ROOM.into(),
+        IssuerScope::Public,
+        BOB.into(),
+        ROOM.into(),
+        vec![],
+        t(0),
+        t(1),
+    )
+    .unwrap_err();
     assert!(format!("{err}").contains("confers nothing"), "{err}");
 }
 
@@ -411,10 +459,11 @@ fn an_empty_actions_list_is_refused_on_deserialization() {
     let json = serde_json::json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
-            "https://firstperson.network/credentials/dtg/v1"
+            "https://registry.trustoverip.org/dtg/context/v1"
         ],
         "type": ["VerifiableCredential", "DTGCredential", "AuthorityCredential"],
         "issuer": ROOM,
+        "issuerScope": "public",
         "validFrom": "2026-01-06T10:00:00Z",
         "credentialSubject": { "id": BOB, "authority": { "scope": ROOM, "actions": [] } }
     })
@@ -457,6 +506,7 @@ fn a_link_names_its_parent_by_digest() {
 fn a_parent_without_an_id_can_still_be_attenuated() {
     let root = DTGCredential::new_vac(
         ROOM.into(),
+        IssuerScope::Public,
         BOB.into(),
         ROOM.into(),
         vec!["read".into(), "write".into()],
@@ -468,7 +518,14 @@ fn a_parent_without_an_id_can_still_be_attenuated() {
     assert!(root.id().is_none());
 
     let agent = root
-        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(4))
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(4),
+            None,
+        )
         .expect("attenuation does not need the parent to have an id");
 
     let v = verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)).expect("verifies");
@@ -486,6 +543,7 @@ fn a_reissued_parent_does_not_carry_its_children() {
     // Same id, same parties, narrower actions — a different credential.
     let reissued = DTGCredential::new_vac(
         ROOM.into(),
+        IssuerScope::Public,
         BOB.into(),
         ROOM.into(),
         vec!["read".into()],
@@ -553,10 +611,12 @@ fn attenuating_from_json_digests_the_wire_form() {
 
     let agent = DTGCredential::attenuate_from_json(
         &received,
+        IssuerScope::Directed,
         AGENT.into(),
         vec!["read".into()],
         t(0),
         t(4),
+        None,
     )
     .expect("attenuation");
 
@@ -579,10 +639,12 @@ fn attenuating_from_json_still_refuses_to_widen() {
 
     let err = DTGCredential::attenuate_from_json(
         &received,
+        IssuerScope::Directed,
         AGENT.into(),
         vec!["delete".into()],
         t(0),
         t(4),
+        None,
     )
     .unwrap_err();
 
@@ -600,10 +662,11 @@ fn a_vac_without_an_expiry_is_refused() {
     let json = serde_json::json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
-            "https://firstperson.network/credentials/dtg/v1"
+            "https://registry.trustoverip.org/dtg/context/v1"
         ],
         "type": ["VerifiableCredential", "DTGCredential", "AuthorityCredential"],
         "issuer": ROOM,
+        "issuerScope": "public",
         "validFrom": "2026-01-06T10:00:00Z",
         "credentialSubject": {
             "id": BOB,
@@ -617,4 +680,287 @@ fn a_vac_without_an_expiry_is_refused() {
         matches!(err, AuthorityError::NoExpiry { index: 0 }),
         "got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// `maxAttenuation`
+
+const SUB_AGENT: &str = "did:key:zBobSubAgent";
+
+/// The spec's worked example: a root the governing party issues, and an agent grant
+/// attenuated from it that forbids attenuating further.
+#[test]
+fn max_attenuation_serializes_inside_the_authority_object() {
+    let agent = root_grant()
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(4),
+            Some(0),
+        )
+        .unwrap();
+    let wire = serde_json::to_value(&agent).unwrap();
+    assert_eq!(
+        wire["credentialSubject"]["authority"]["maxAttenuation"],
+        serde_json::json!(0)
+    );
+    assert_eq!(wire["issuerScope"], "directed");
+
+    let back: DTGCredential = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        back.credential().authority().unwrap().max_attenuation,
+        Some(0)
+    );
+}
+
+/// `0` forbids attenuation outright: refused at issue, and refused by the verifier when
+/// somebody builds the child by hand.
+#[test]
+fn max_attenuation_zero_forbids_a_child() {
+    let root = root_grant().with_max_attenuation(0).unwrap();
+    let err = root
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(4),
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, DTGCredentialError::AttenuationWidens(_)),
+        "{err}"
+    );
+
+    // Built by hand, bypassing the constructor's check.
+    let mut forged = root_grant()
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(4),
+            None,
+        )
+        .unwrap();
+    forged.credential_mut().authority_mut().unwrap().parent =
+        Some(root.digest_multibase().unwrap());
+    assert!(matches!(
+        verify_chain(&[forged, root], ROOM, ROOM, "read", AGENT, t(1)),
+        Err(AuthorityError::ExceedsMaxAttenuation {
+            ancestor: 1,
+            max_attenuation: 0,
+            ..
+        })
+    ));
+}
+
+/// A child inherits the ceiling: absent a request it takes `n - 1`, and a request above
+/// that is refused.
+#[test]
+fn max_attenuation_is_inherited_and_never_raised() {
+    let root = root_grant().with_max_attenuation(2).unwrap();
+    let agent = root
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(4),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        agent.credential().authority().unwrap().max_attenuation,
+        Some(1)
+    );
+
+    let err = root
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(4),
+            Some(2),
+        )
+        .unwrap_err();
+    assert!(format!("{err}").contains("maxAttenuation"), "{err}");
+
+    // Two steps below a root bearing 2 is allowed.
+    let sub = agent
+        .attenuate(
+            IssuerScope::Pairwise,
+            SUB_AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(2),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        sub.credential().authority().unwrap().max_attenuation,
+        Some(0)
+    );
+    verify_chain(
+        &[sub.clone(), agent.clone(), root.clone()],
+        ROOM,
+        ROOM,
+        "read",
+        SUB_AGENT,
+        t(1),
+    )
+    .expect("within the limit");
+
+    // A link that bears no limit of its own does not raise one: it is still bounded by
+    // its ancestors. Two steps below a root bearing 2 verifies whatever the middle bears...
+    let mut unbounded = agent.clone();
+    unbounded
+        .credential_mut()
+        .authority_mut()
+        .unwrap()
+        .max_attenuation = None;
+    let mut sub = sub;
+    sub.credential_mut()
+        .authority_mut()
+        .unwrap()
+        .max_attenuation = None;
+    sub.credential_mut().authority_mut().unwrap().parent =
+        Some(unbounded.digest_multibase().unwrap());
+    verify_chain(
+        &[sub.clone(), unbounded.clone(), root.clone()],
+        ROOM,
+        ROOM,
+        "read",
+        SUB_AGENT,
+        t(1),
+    )
+    .expect("two below an ancestor bearing 2");
+
+    // ...and a third step below it is refused, by the ancestor's limit.
+    let mut third = DTGCredential::new_vac(
+        SUB_AGENT.into(),
+        IssuerScope::Pairwise,
+        MALLORY.into(),
+        ROOM.into(),
+        vec!["read".into()],
+        t(0),
+        t(1),
+    )
+    .unwrap();
+    third.credential_mut().authority_mut().unwrap().parent = Some(sub.digest_multibase().unwrap());
+    assert!(matches!(
+        verify_chain(
+            &[third, sub, unbounded, root],
+            ROOM,
+            ROOM,
+            "read",
+            MALLORY,
+            t(0)
+        ),
+        Err(AuthorityError::ExceedsMaxAttenuation {
+            index: 0,
+            ancestor: 3,
+            depth: 3,
+            max_attenuation: 2,
+        })
+    ));
+}
+
+/// A link bearing a limit above what its parent permits is refused, even inside the depth.
+#[test]
+fn a_link_raising_its_parents_max_attenuation_is_refused() {
+    let root = root_grant().with_max_attenuation(2).unwrap();
+    let mut agent = root
+        .attenuate(
+            IssuerScope::Directed,
+            AGENT.into(),
+            vec!["read".into()],
+            t(0),
+            t(4),
+            None,
+        )
+        .unwrap();
+    agent
+        .credential_mut()
+        .authority_mut()
+        .unwrap()
+        .max_attenuation = Some(5);
+
+    assert!(matches!(
+        verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)),
+        Err(AuthorityError::RaisesMaxAttenuation {
+            index: 0,
+            found: 5,
+            allowed: 1,
+        })
+    ));
+}
+
+// ---------------------------------------------------------------------------------------
+// Community role VACs
+
+const COMMUNITY: &str = "did:webvh:zcommunity:chess-club.example";
+const MEMBER: &str = "did:key:zMember";
+
+/// A role is a community-issued VAC scoped to the community, conferring `role:<name>`, and
+/// verifies as a one-link chain the community roots.
+#[test]
+fn a_community_role_vac_verifies_for_its_role() {
+    let vetter = DTGCredential::new_community_role_vac(
+        COMMUNITY.into(),
+        MEMBER.into(),
+        "vetter",
+        t(0),
+        t(24 * 90),
+    )
+    .unwrap();
+    assert_eq!(vetter.issuer_scope(), IssuerScope::Public);
+    assert_eq!(
+        dtg_credentials::create::role_action("vetter"),
+        "role:vetter"
+    );
+
+    let verified = verify_chain(
+        std::slice::from_ref(&vetter),
+        COMMUNITY,
+        COMMUNITY,
+        "role:vetter",
+        MEMBER,
+        t(1),
+    )
+    .expect("the community conferred the role");
+    assert_eq!(verified.actions, ["role:vetter"]);
+
+    // Exact and case-sensitive: no other role, and no other spelling.
+    for other in ["role:admin", "role:Vetter", "vetter"] {
+        assert!(matches!(
+            verify_chain(
+                std::slice::from_ref(&vetter),
+                COMMUNITY,
+                COMMUNITY,
+                other,
+                MEMBER,
+                t(1)
+            ),
+            Err(AuthorityError::ActionNotGranted { .. })
+        ));
+    }
+
+    // Not the member's to present on someone else's behalf, and not a grant anywhere else.
+    assert!(
+        verify_chain(
+            std::slice::from_ref(&vetter),
+            COMMUNITY,
+            COMMUNITY,
+            "role:vetter",
+            MALLORY,
+            t(1)
+        )
+        .is_err()
+    );
+    assert!(verify_chain(&[vetter], COMMUNITY, ROOM, "role:vetter", MEMBER, t(1)).is_err());
 }

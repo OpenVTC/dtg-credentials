@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use dtg_credentials::delegation::{DelegationError, MAX_CHAIN_DEPTH, verify_chain};
-use dtg_credentials::{DTGCredential, DTGCredentialError};
+use dtg_credentials::{DTGCredential, DTGCredentialError, IssuerScope};
 use serde_json::Value;
 
 const ALICE: &str = "did:key:zAlice";
@@ -29,6 +29,7 @@ fn wire(c: &DTGCredential) -> Value {
 fn root_delegation() -> DTGCredential {
     DTGCredential::new_vdc(
         ALICE.into(),
+        IssuerScope::Directed,
         AGENT.into(),
         t(0),
         t(24 * 90),
@@ -83,8 +84,14 @@ fn a_chain_rooted_elsewhere_establishes_nothing() {
 #[test]
 fn an_acceptance_completes_the_edge() {
     let grant = root_delegation();
-    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
-        .expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(
+        &wire(&grant),
+        AGENT,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 90),
+    )
+    .expect("accepts");
 
     // Mirrored parties: the delegate issues, the delegator is the subject.
     assert_eq!(acceptance.issuer(), AGENT);
@@ -99,8 +106,14 @@ fn an_acceptance_completes_the_edge() {
 #[test]
 fn an_acceptance_restates_no_scope() {
     let grant = root_delegation();
-    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
-        .expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(
+        &wire(&grant),
+        AGENT,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 90),
+    )
+    .expect("accepts");
 
     let d = acceptance.credential().delegation().unwrap();
     assert!(d.scope.is_none());
@@ -113,12 +126,19 @@ fn an_acceptance_restates_no_scope() {
 #[test]
 fn a_reissued_grant_is_no_longer_accepted_by_the_old_acceptance() {
     let grant = root_delegation();
-    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
-        .expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(
+        &wire(&grant),
+        AGENT,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 90),
+    )
+    .expect("accepts");
 
     // Same parties, wider appointment.
     let reissued = DTGCredential::new_vdc(
         ALICE.into(),
+        IssuerScope::Directed,
         AGENT.into(),
         t(0),
         t(24 * 90),
@@ -143,11 +163,23 @@ fn a_reissued_grant_is_no_longer_accepted_by_the_old_acceptance() {
 #[test]
 fn an_acceptance_cannot_itself_be_accepted() {
     let grant = root_delegation();
-    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
-        .expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(
+        &wire(&grant),
+        AGENT,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 90),
+    )
+    .expect("accepts");
 
-    let err = DTGCredential::new_delegate_vdc_for(&wire(&acceptance), ALICE, t(0), t(24 * 90))
-        .unwrap_err();
+    let err = DTGCredential::new_delegate_vdc_for(
+        &wire(&acceptance),
+        ALICE,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 90),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, DTGCredentialError::NotADelegationGrant(_)),
         "got {err:?}"
@@ -160,8 +192,14 @@ fn an_acceptance_cannot_itself_be_accepted() {
 fn a_grant_appointing_someone_else_is_refused() {
     let grant = root_delegation(); // appoints AGENT
 
-    let err =
-        DTGCredential::new_delegate_vdc_for(&wire(&grant), MALLORY, t(0), t(24 * 90)).unwrap_err();
+    let err = DTGCredential::new_delegate_vdc_for(
+        &wire(&grant),
+        MALLORY,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 90),
+    )
+    .unwrap_err();
     assert!(
         matches!(
             err,
@@ -178,15 +216,27 @@ fn a_grant_appointing_someone_else_is_refused() {
 fn an_acceptance_may_not_outlive_its_grant() {
     let grant = root_delegation(); // valid until t(24 * 90)
 
-    let err =
-        DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 91)).unwrap_err();
+    let err = DTGCredential::new_delegate_vdc_for(
+        &wire(&grant),
+        AGENT,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 91),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, DTGCredentialError::OutlivesGrant { .. }),
         "got {err:?}"
     );
 
-    DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 30))
-        .expect("ending before the grant is within it");
+    DTGCredential::new_delegate_vdc_for(
+        &wire(&grant),
+        AGENT,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 30),
+    )
+    .expect("ending before the grant is within it");
 }
 
 /// Accepting is binding, not verification: an unsigned grant accepts perfectly well, and
@@ -196,7 +246,8 @@ fn an_acceptance_may_not_outlive_its_grant() {
 fn an_unsigned_grant_does_not_verify() {
     let grant = wire(&root_delegation());
 
-    DTGCredential::new_delegate_vdc_for(&grant, AGENT, t(0), t(24 * 90)).expect("binds");
+    DTGCredential::new_delegate_vdc_for(&grant, AGENT, IssuerScope::Directed, t(0), t(24 * 90))
+        .expect("binds");
 
     let err = dtg_credentials::verify_grant_with_public_key(&grant, &[0u8; 32], t(1)).unwrap_err();
     assert!(matches!(err, DTGCredentialError::NotSigned), "got {err:?}");
@@ -206,9 +257,14 @@ fn an_unsigned_grant_does_not_verify() {
 #[test]
 fn an_acceptance_from_the_wrong_party_binds_nothing() {
     let grant = root_delegation();
-    let mut acceptance =
-        DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
-            .expect("accepts");
+    let mut acceptance = DTGCredential::new_delegate_vdc_for(
+        &wire(&grant),
+        AGENT,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 90),
+    )
+    .expect("accepts");
     acceptance.credential_mut().issuer = MALLORY.into();
 
     assert!(!acceptance.accepts(&grant).unwrap());
@@ -218,8 +274,14 @@ fn an_acceptance_from_the_wrong_party_binds_nothing() {
 #[test]
 fn an_acceptance_in_a_chain_is_refused() {
     let grant = root_delegation();
-    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&grant), AGENT, t(0), t(24 * 90))
-        .expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(
+        &wire(&grant),
+        AGENT,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 90),
+    )
+    .expect("accepts");
 
     let err = verify_chain(&[acceptance], ALICE, "schedule:read", AGENT, t(1)).unwrap_err();
     assert!(
@@ -265,7 +327,13 @@ fn the_principal_is_not_the_delegate() {
 fn an_intermediate_delegate_cannot_present_a_chain_below_it() {
     let root = root_delegation();
     let sub = root
-        .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(0), t(24))
+        .redelegate(
+            IssuerScope::Directed,
+            SUBAGENT.into(),
+            vec!["schedule:read".into()],
+            t(0),
+            t(24),
+        )
         .expect("redelegation");
 
     // The sub-agent presents it: accepted.
@@ -295,7 +363,13 @@ fn an_intermediate_delegate_cannot_present_a_chain_below_it() {
 fn a_permitted_redelegation_verifies() {
     let root = root_delegation();
     let sub = root
-        .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(0), t(24))
+        .redelegate(
+            IssuerScope::Directed,
+            SUBAGENT.into(),
+            vec!["schedule:read".into()],
+            t(0),
+            t(24),
+        )
         .expect("redelegation");
 
     let v =
@@ -313,13 +387,25 @@ fn a_permitted_redelegation_verifies() {
 fn a_redelegation_spends_the_depth_budget() {
     let root = root_delegation(); // maxDepth 1
     let sub = root
-        .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(0), t(24))
+        .redelegate(
+            IssuerScope::Directed,
+            SUBAGENT.into(),
+            vec!["schedule:read".into()],
+            t(0),
+            t(24),
+        )
         .unwrap();
 
     assert_eq!(sub.credential().delegation().unwrap().max_depth, Some(0));
 
     let err = sub
-        .redelegate(MALLORY.into(), vec!["schedule:read".into()], t(0), t(24))
+        .redelegate(
+            IssuerScope::Directed,
+            MALLORY.into(),
+            vec!["schedule:read".into()],
+            t(0),
+            t(24),
+        )
         .unwrap_err();
     assert!(
         format!("{err}").contains("does not permit re-delegation"),
@@ -334,6 +420,7 @@ fn a_redelegation_spends_the_depth_budget() {
 fn absence_of_max_depth_prohibits_redelegation() {
     let root = DTGCredential::new_vdc(
         ALICE.into(),
+        IssuerScope::Directed,
         AGENT.into(),
         t(0),
         t(24 * 90),
@@ -343,7 +430,13 @@ fn absence_of_max_depth_prohibits_redelegation() {
     .unwrap();
 
     let err = root
-        .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(0), t(24))
+        .redelegate(
+            IssuerScope::Directed,
+            SUBAGENT.into(),
+            vec!["schedule:read".into()],
+            t(0),
+            t(24),
+        )
         .unwrap_err();
     assert!(
         format!("{err}").contains("does not permit re-delegation"),
@@ -356,7 +449,13 @@ fn absence_of_max_depth_prohibits_redelegation() {
 fn a_redelegation_cannot_widen_the_scope() {
     let root = root_delegation();
     let err = root
-        .redelegate(SUBAGENT.into(), vec!["schedule:cancel".into()], t(0), t(24))
+        .redelegate(
+            IssuerScope::Directed,
+            SUBAGENT.into(),
+            vec!["schedule:cancel".into()],
+            t(0),
+            t(24),
+        )
         .unwrap_err();
     assert!(format!("{err}").contains("not in the scope"), "{err}");
 }
@@ -368,6 +467,7 @@ fn a_widened_link_is_refused_by_the_verifier() {
     let root = root_delegation();
     let mut widened = DTGCredential::new_vdc(
         AGENT.into(),
+        IssuerScope::Directed,
         SUBAGENT.into(),
         t(0),
         t(24),
@@ -395,7 +495,9 @@ fn a_widened_link_is_refused_by_the_verifier() {
 fn a_link_issued_by_someone_other_than_the_parents_delegate_is_refused() {
     let root = root_delegation(); // appoints AGENT
     let mut grafted = DTGCredential::new_vdc(
-        MALLORY.into(), // not AGENT
+        MALLORY.into(),
+        IssuerScope::Directed,
+        // not AGENT
         MALLORY.into(),
         t(0),
         t(24),
@@ -421,6 +523,7 @@ fn a_redelegation_cannot_outlive_its_parent() {
     let root = root_delegation();
     let err = root
         .redelegate(
+            IssuerScope::Directed,
             SUBAGENT.into(),
             vec!["schedule:read".into()],
             t(0),
@@ -436,7 +539,13 @@ fn a_redelegation_cannot_outlive_its_parent() {
 fn a_link_naming_a_different_parent_is_refused() {
     let root = root_delegation();
     let mut sub = root
-        .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(0), t(24))
+        .redelegate(
+            IssuerScope::Directed,
+            SUBAGENT.into(),
+            vec!["schedule:read".into()],
+            t(0),
+            t(24),
+        )
         .unwrap();
     if let Some(d) = sub.credential_mut().delegation_mut() {
         // A well-formed digest of something else entirely.
@@ -460,7 +569,13 @@ fn a_link_naming_a_different_parent_is_refused() {
 fn a_truncated_chain_does_not_resolve_to_the_principal() {
     let root = root_delegation();
     let sub = root
-        .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(0), t(24))
+        .redelegate(
+            IssuerScope::Directed,
+            SUBAGENT.into(),
+            vec!["schedule:read".into()],
+            t(0),
+            t(24),
+        )
         .unwrap();
 
     let err = verify_chain(&[sub], ALICE, "schedule:read", SUBAGENT, t(1)).unwrap_err();
@@ -496,8 +611,16 @@ fn a_root_that_names_a_parent_is_refused() {
 /// A VDC cannot express an unbounded appointment by emptying its scope, at construction...
 #[test]
 fn an_empty_scope_is_refused_at_construction() {
-    let err =
-        DTGCredential::new_vdc(ALICE.into(), AGENT.into(), t(0), t(24), vec![], None).unwrap_err();
+    let err = DTGCredential::new_vdc(
+        ALICE.into(),
+        IssuerScope::Directed,
+        AGENT.into(),
+        t(0),
+        t(24),
+        vec![],
+        None,
+    )
+    .unwrap_err();
     assert!(
         matches!(err, DTGCredentialError::MalformedDelegation(_)),
         "got {err:?}"
@@ -513,6 +636,7 @@ fn an_inverted_window_is_refused_at_issue() {
 
     let err = DTGCredential::new_vdc(
         ALICE.into(),
+        IssuerScope::Directed,
         AGENT.into(),
         t(24),
         t(0),
@@ -524,6 +648,7 @@ fn an_inverted_window_is_refused_at_issue() {
 
     let err = DTGCredential::new_vdc(
         ALICE.into(),
+        IssuerScope::Directed,
         AGENT.into(),
         t(0),
         t(0),
@@ -535,12 +660,19 @@ fn an_inverted_window_is_refused_at_issue() {
 
     let root = root_delegation();
     let err = root
-        .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(24), t(1))
+        .redelegate(
+            IssuerScope::Directed,
+            SUBAGENT.into(),
+            vec!["schedule:read".into()],
+            t(24),
+            t(1),
+        )
         .unwrap_err();
     assert!(is_window_error(&err), "got {err:?}");
 
     let err = DTGCredential::redelegate_from_json(
         &wire(&root),
+        IssuerScope::Directed,
         SUBAGENT.into(),
         vec!["schedule:read".into()],
         t(1),
@@ -549,7 +681,14 @@ fn an_inverted_window_is_refused_at_issue() {
     .unwrap_err();
     assert!(is_window_error(&err), "got {err:?}");
 
-    let err = DTGCredential::new_delegate_vdc_for(&wire(&root), AGENT, t(24), t(0)).unwrap_err();
+    let err = DTGCredential::new_delegate_vdc_for(
+        &wire(&root),
+        AGENT,
+        IssuerScope::Directed,
+        t(24),
+        t(0),
+    )
+    .unwrap_err();
     assert!(is_window_error(&err), "got {err:?}");
 }
 
@@ -559,10 +698,11 @@ fn an_empty_scope_is_refused_on_deserialization() {
     let json = serde_json::json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
-            "https://firstperson.network/credentials/dtg/v1"
+            "https://registry.trustoverip.org/dtg/context/v1"
         ],
         "type": ["VerifiableCredential", "DTGCredential", "DelegationCredential"],
         "issuer": ALICE,
+        "issuerScope": "public",
         "validFrom": "2026-01-06T10:00:00Z",
         "validUntil": "2026-04-06T10:00:00Z",
         "credentialSubject": { "id": AGENT, "delegation": { "scope": [] } }
@@ -579,10 +719,11 @@ fn a_delegation_that_is_neither_half_is_refused() {
     let json = serde_json::json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
-            "https://firstperson.network/credentials/dtg/v1"
+            "https://registry.trustoverip.org/dtg/context/v1"
         ],
         "type": ["VerifiableCredential", "DTGCredential", "DelegationCredential"],
         "issuer": ALICE,
+        "issuerScope": "public",
         "validFrom": "2026-01-06T10:00:00Z",
         "validUntil": "2026-04-06T10:00:00Z",
         "credentialSubject": { "id": AGENT, "delegation": { "maxDepth": 2 } }
@@ -603,10 +744,11 @@ fn a_credential_carrying_both_scope_and_accepts_is_refused() {
     let json = serde_json::json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
-            "https://firstperson.network/credentials/dtg/v1"
+            "https://registry.trustoverip.org/dtg/context/v1"
         ],
         "type": ["VerifiableCredential", "DTGCredential", "DelegationCredential"],
         "issuer": AGENT,
+        "issuerScope": "public",
         "validFrom": "2026-01-06T10:00:00Z",
         "validUntil": "2026-04-06T10:00:00Z",
         "credentialSubject": {
@@ -632,10 +774,11 @@ fn a_delegation_without_an_expiry_is_refused() {
     let json = serde_json::json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
-            "https://firstperson.network/credentials/dtg/v1"
+            "https://registry.trustoverip.org/dtg/context/v1"
         ],
         "type": ["VerifiableCredential", "DTGCredential", "DelegationCredential"],
         "issuer": ALICE,
+        "issuerScope": "public",
         "validFrom": "2026-01-06T10:00:00Z",
         "credentialSubject": { "id": AGENT, "delegation": { "scope": ["schedule:read"] } }
     });
@@ -688,8 +831,14 @@ fn a_vdc_round_trips_through_json() {
     assert!(d.parent.is_none(), "a root delegation carries no parent");
     assert!(d.accepts.is_none(), "a grant carries no accepts");
 
-    let acceptance = DTGCredential::new_delegate_vdc_for(&wire(&root), AGENT, t(0), t(24 * 90))
-        .expect("accepts");
+    let acceptance = DTGCredential::new_delegate_vdc_for(
+        &wire(&root),
+        AGENT,
+        IssuerScope::Directed,
+        t(0),
+        t(24 * 90),
+    )
+    .expect("accepts");
     let back: DTGCredential =
         serde_json::from_str(&serde_json::to_string(&acceptance).unwrap()).unwrap();
     assert!(
@@ -708,6 +857,7 @@ fn redelegating_from_json_digests_the_wire_form() {
 
     let sub = DTGCredential::redelegate_from_json(
         &grant,
+        IssuerScope::Directed,
         SUBAGENT.into(),
         vec!["schedule:read".into()],
         t(0),
