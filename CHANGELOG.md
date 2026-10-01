@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-01
+
+### Changed
+
+- **`affinidi-data-integrity` 0.7 → 0.8.** `DataIntegrityProof`, `SignOptions`,
+  `VerifyOptions` and `DataIntegrityError` are part of this crate's API, so this is a
+  breaking release. 0.8 is the release that moved `affinidi-bbs` to 0.4 (0.7.14 did the
+  same in a patch release, affinidi-tdk-rs #912). A caller still on data-integrity 0.7
+  would see two proof types; move both together. No wire change: credentials and proofs
+  are byte-identical to 0.12.
+- Dev-dependency `affinidi-tdk` 0.16 → 0.22.
+
 ## [0.12.0] - 2026-09-30
 
 **Conformance to the current DTG Core Credentials draft (Working Draft 0.6.0) and its frozen
