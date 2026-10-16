@@ -340,6 +340,9 @@ pub enum DTGCredentialError {
 
     /// A proof verified, but was made with a verification method that does not belong to
     /// the credential's issuer.
+    ///
+    /// Returned by [DTGCredential::verify_proof_with_public_key] and
+    /// `verify_grant_with_public_key`.
     #[error("the proof was made by `{verification_method}`, which is not the issuer `{issuer}`")]
     ProofNotFromIssuer {
         issuer: String,
@@ -852,9 +855,25 @@ impl DTGCredential {
     }
 
     #[cfg(feature = "affinidi-signing")]
-    /// Verify the credential if you already know the public key bytes
-    /// otherwise use the affinidi_tdk:verify_data() method
-    /// public_key_bytes: The public key bytes to use to verify the credential
+    /// Verify the credential's proof under `public_key_bytes`, and that the proof was made
+    /// by a verification method of the credential's issuer.
+    ///
+    /// Checks, in order:
+    ///
+    /// 1. [DTGCredential::validate];
+    /// 2. the credential carries a proof, else [DTGCredentialError::NotSigned];
+    /// 3. the proof verifies under `public_key_bytes` over the credential without its
+    ///    `proof`, else [DTGCredentialError::DataIntegrity];
+    /// 4. the proof's `verificationMethod` belongs to [DTGCredential::issuer] — the DID
+    ///    before its `#` fragment is exactly the issuer, and a bare `#fragment` is read
+    ///    against the issuer — else [DTGCredentialError::ProofNotFromIssuer].
+    ///
+    /// # Where `public_key_bytes` comes from
+    ///
+    /// Resolve it from the issuer's DID document, for the verification method the proof
+    /// names, and confirm that method is authorized for assertion. Step 4 ties the proof to
+    /// the issuer only as far as the key does: a key taken from the credential itself, or
+    /// from whoever sent it, establishes nothing about the issuer.
     ///
     /// # Errors
     ///
@@ -881,7 +900,7 @@ impl DTGCredential {
         };
 
         proof.verify_with_public_key(&unsigned, public_key_bytes, VerifyOptions::new())?;
-        Ok(())
+        check_proof_from_issuer(self.issuer(), &proof.verification_method)
     }
 
     /// Is this credential a W3C VC Version 1.1 or 2.0 credential?
@@ -1083,7 +1102,8 @@ pub fn task_digest_multibase_json(document: &Value) -> Result<String, DTGCredent
 /// 2. the proof verifies under `public_key` over the document with its top-level `proof`
 ///    removed, else [DTGCredentialError::DataIntegrity];
 /// 3. the proof's `verificationMethod` belongs to the grant's `issuer` — the DID before its
-///    `#` fragment is exactly the issuer — else [DTGCredentialError::ProofNotFromIssuer];
+///    `#` fragment is exactly the issuer, and a bare `#fragment` is read against the issuer —
+///    else [DTGCredentialError::ProofNotFromIssuer];
 /// 4. the validity window is well formed and contains `at`, else
 ///    [DTGCredentialError::InvalidValidityWindow] or [DTGCredentialError::NotValidAt].
 ///
@@ -1122,16 +1142,7 @@ pub fn verify_grant_with_public_key(
 
     let issuer = create::issuer_of(object)
         .ok_or_else(|| DTGCredentialError::MalformedCredential("no `issuer`".into()))?;
-    let method_did = proof
-        .verification_method
-        .split_once('#')
-        .map_or(proof.verification_method.as_str(), |(did, _)| did);
-    if method_did != issuer {
-        return Err(DTGCredentialError::ProofNotFromIssuer {
-            issuer,
-            verification_method: proof.verification_method,
-        });
-    }
+    check_proof_from_issuer(&issuer, &proof.verification_method)?;
 
     let valid_from = create::read_timestamp(object, "validFrom", "issuanceDate")
         .map_err(DTGCredentialError::MalformedCredential)?
@@ -1143,6 +1154,36 @@ pub fn verify_grant_with_public_key(
         return Err(DTGCredentialError::NotValidAt { at });
     }
 
+    Ok(())
+}
+
+/// Refuses a proof whose `verification_method` does not belong to `issuer`.
+///
+/// A method belongs to the issuer when the DID before its `#` fragment is exactly the
+/// issuer, when it is the issuer itself, or when it is a bare `#fragment`, which is read
+/// against the issuer. Comparison is verbatim: a DID URL carrying a path or query before the
+/// fragment is not the issuer.
+///
+/// A proof that verifies under some key shows only that the holder of that key signed. Every
+/// public verification entry point runs this after the signature, so that a caller who
+/// resolves the key the proof names and then trusts the credential's `issuer` is trusting
+/// the party that signed.
+#[cfg(feature = "affinidi-signing")]
+fn check_proof_from_issuer(
+    issuer: &str,
+    verification_method: &str,
+) -> Result<(), DTGCredentialError> {
+    let method_did = match verification_method.split_once('#') {
+        Some(("", _)) => issuer,
+        Some((did, _)) => did,
+        None => verification_method,
+    };
+    if issuer.is_empty() || method_did != issuer {
+        return Err(DTGCredentialError::ProofNotFromIssuer {
+            issuer: issuer.to_string(),
+            verification_method: verification_method.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -3761,7 +3802,7 @@ mod tests {
     async fn test_signing() {
         use affinidi_secrets_resolver::secrets::Secret;
 
-        let secret = Secret::generate_ed25519(None, None);
+        let secret = Secret::generate_ed25519(Some("did:example:issuer#key-1"), None);
 
         let mut cred = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),
@@ -3797,7 +3838,7 @@ mod tests {
     async fn test_id_is_covered_by_the_proof() {
         use affinidi_secrets_resolver::secrets::Secret;
 
-        let secret = Secret::generate_ed25519(None, None);
+        let secret = Secret::generate_ed25519(Some("did:example:issuer#key-1"), None);
 
         let mut cred = DTGCredential::new_vrc(
             "did:example:issuer".to_string(),

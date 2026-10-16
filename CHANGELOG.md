@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`DTGCredential::verify_proof_with_public_key` now refuses a proof that was not made by
+  a key of the credential's issuer.** It verified the signature under the key it was handed
+  but never checked that the proof's `verificationMethod` belongs to `issuer`, so a caller
+  that resolved the method the proof names and then trusted `issuer()` accepted a credential
+  naming any issuer, signed by anyone. It now returns
+  `DTGCredentialError::ProofNotFromIssuer`, as `verify_grant_with_public_key` already did;
+  the two share one check. A method belongs to the issuer when the DID before its `#` is
+  exactly the issuer, when it is the issuer itself, or when it is a bare `#fragment` (read
+  against the issuer — `verify_grant_with_public_key` previously refused that form). The
+  comparison is verbatim. A caller signing with a key whose id is not a method of the issuer
+  will now see its own credentials refused; give the signing secret the issuer's method id.
+
 ## [0.13.0] - 2026-10-01
 
 ### Changed
