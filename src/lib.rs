@@ -4,6 +4,7 @@
 use affinidi_data_integrity::DataIntegrityProof;
 #[cfg(feature = "affinidi-signing")]
 use affinidi_data_integrity::{DataIntegrityError, SignOptions, VerifyOptions};
+use affinidi_did_common::scid::same_reference;
 #[cfg(feature = "affinidi-signing")]
 use affinidi_secrets_resolver::secrets::Secret;
 use chrono::{DateTime, Utc};
@@ -675,7 +676,10 @@ impl DTGCredential {
             return Ok(false);
         }
 
-        if self.issuer() != grant.subject() || self.subject() != grant.issuer() {
+        // By DID: a did:scid party may carry its `?src=` locator (VTI-KEY-160).
+        if !same_reference(self.issuer(), grant.subject())
+            || !same_reference(self.subject(), grant.issuer())
+        {
             return Ok(false);
         }
 
@@ -732,7 +736,10 @@ impl DTGCredential {
             return Ok(false);
         };
 
-        if self.issuer() != grant.subject() || self.subject() != grant.issuer() {
+        // By DID: a did:scid party may carry its `?src=` locator (VTI-KEY-160).
+        if !same_reference(self.issuer(), grant.subject())
+            || !same_reference(self.subject(), grant.issuer())
+        {
             return Ok(false);
         }
 

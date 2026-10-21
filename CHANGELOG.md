@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **did:scid parties are matched by their DID.** Chain verification (`verify_chain`,
+  delegation chains) and the acknowledgement/acceptance pairing compare an issuer,
+  subject, presenter, governing party or principal by DID, ignoring a did:scid `?src=`
+  locator (VTI-KEY-160): `did:scid:vh:1:<scid>?src=a.example` and `did:scid:vh:1:<scid>`
+  are one party. A did:scid and its did:webvh log are still two. Every other DID compares
+  as before. A proof's `verificationMethod` is still bound to its issuer exactly.
+- Depends on `affinidi-did-common` directly (already in the graph through
+  `affinidi-data-integrity`).
+
 ### Security
 
 - **`DTGCredential::verify_proof_with_public_key` now refuses a proof that was not made by

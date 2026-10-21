@@ -16,6 +16,10 @@ affinidi-signing = ["dep:affinidi-secrets-resolver"]
 
 [dependencies]
 affinidi-data-integrity = "0.8"
+# did:scid parties compare by DID, ignoring a `?src=` locator
+# (`scid::same_reference`, 0.4.4). Already in the graph through
+# affinidi-data-integrity.
+affinidi-did-common = { version = "0.4", default-features = false }
 affinidi-secrets-resolver = { version = "0.5", optional = true }
 
 chrono = "0.4"
@@ -50,3 +54,4 @@ required-features = ["affinidi-signing"]
 [[example]]
 name = "data_room"
 required-features = ["affinidi-signing"]
+
