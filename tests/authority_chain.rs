@@ -964,3 +964,49 @@ fn a_community_role_vac_verifies_for_its_role() {
     );
     assert!(verify_chain(&[vetter], COMMUNITY, ROOM, "role:vetter", MEMBER, t(1)).is_err());
 }
+
+/// A did:scid party is one identity whichever `?src=` locator it is named with
+/// (VTI-KEY-160): the root may be issued by the room's DID URL and checked against
+/// its bare DID, and a holder presenting with its locator is still the subject.
+#[test]
+fn a_did_scid_party_is_matched_by_its_did() {
+    const SCID_ROOM: &str = "did:scid:vh:1:QmRoom?src=example.com/rooms/7f3a";
+    const SCID_ROOM_BARE: &str = "did:scid:vh:1:QmRoom";
+    const SCID_BOB: &str = "did:scid:vh:1:QmBob";
+    let root = DTGCredential::new_vac(
+        SCID_ROOM.into(),
+        IssuerScope::Public,
+        SCID_BOB.into(),
+        SCID_ROOM.into(),
+        vec!["read".into()],
+        t(0),
+        t(24),
+    )
+    .expect("root grant")
+    .with_id("urn:uuid:scid-root");
+
+    verify_chain(
+        std::slice::from_ref(&root),
+        SCID_ROOM_BARE,
+        SCID_ROOM,
+        "read",
+        "did:scid:vh:1:QmBob?src=bob.example",
+        t(1),
+    )
+    .expect("the same parties, named with and without a locator");
+
+    // Its did:webvh log is another identity (VTI-KEY-164).
+    let err = verify_chain(
+        &[root],
+        "did:webvh:QmRoom:example.com:rooms:7f3a",
+        SCID_ROOM,
+        "read",
+        SCID_BOB,
+        t(1),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, AuthorityError::RootNotGoverning { .. }),
+        "got {err:?}"
+    );
+}

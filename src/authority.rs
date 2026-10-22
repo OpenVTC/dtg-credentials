@@ -79,6 +79,7 @@
 //! party chooses, so this module does not perform it: check
 //! [`crate::DTGCommon::credential_status`] on every link that carries one.
 
+use affinidi_did_common::scid::same_reference;
 use chrono::{DateTime, Utc};
 
 use crate::{DTGCredential, DTGCredentialType};
@@ -365,7 +366,9 @@ pub fn verify_chain(
     let leaf = &chain[0];
     let leaf_grant = leaf.credential().authority().expect("checked above");
     let leaf_subject = leaf.credential().subject();
-    if leaf_subject != presenter {
+    // Compared by DID: a did:scid party may be named with the `?src=` locator
+    // it is resolved through (VTI-KEY-160), which is not part of who it is.
+    if !same_reference(leaf_subject, presenter) {
         return Err(AuthorityError::NotThePresenter {
             subject: leaf_subject.to_string(),
             presenter: presenter.to_string(),
@@ -419,7 +422,7 @@ pub fn verify_chain(
         }
 
         // Only the party a grant was made to may attenuate it.
-        if link.credential().issuer() != parent.credential().subject() {
+        if !same_reference(link.credential().issuer(), parent.credential().subject()) {
             return Err(AuthorityError::IssuerNotParentSubject {
                 index,
                 issuer: link.credential().issuer().to_string(),
@@ -491,7 +494,7 @@ pub fn verify_chain(
     // The root must be the governing party's, and must claim to be a root.
     let root = chain.last().expect("non-empty");
     let root_grant = root.credential().authority().expect("checked above");
-    if root.credential().issuer() != governing_party {
+    if !same_reference(root.credential().issuer(), governing_party) {
         return Err(AuthorityError::RootNotGoverning {
             root_issuer: root.credential().issuer().to_string(),
             expected: governing_party.to_string(),
