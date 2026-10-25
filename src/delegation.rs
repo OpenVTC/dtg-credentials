@@ -69,6 +69,7 @@
 //!
 //! Nothing else. Invocation binding used to be listed here; see below.
 
+use affinidi_did_common::scid::same_reference;
 use chrono::{DateTime, Utc};
 
 use crate::{DTGCredential, DTGCredentialType};
@@ -296,7 +297,9 @@ pub fn verify_chain(
     // principal. The check is only as good as `presenter`: see the module docs on what a
     // caller must have established before passing one.
     let leaf_delegate = chain[0].credential().subject();
-    if leaf_delegate != presenter {
+    // Compared by DID: a did:scid party may be named with the `?src=` locator
+    // it is resolved through (VTI-KEY-160), which is not part of who it is.
+    if !same_reference(leaf_delegate, presenter) {
         return Err(DelegationError::NotTheDelegate {
             delegate: leaf_delegate.to_string(),
             presenter: presenter.to_string(),
@@ -346,7 +349,7 @@ pub fn verify_chain(
         }
 
         // Only the party a delegation appointed may re-delegate it.
-        if link.credential().issuer() != parent.credential().subject() {
+        if !same_reference(link.credential().issuer(), parent.credential().subject()) {
             return Err(DelegationError::IssuerNotParentSubject {
                 index,
                 issuer: link.credential().issuer().to_string(),
@@ -404,7 +407,7 @@ pub fn verify_chain(
     // resolved to such a root establishes no representation.
     let root = chain.last().expect("non-empty");
     let root_grant = root.credential().delegation().expect("checked above");
-    if root.credential().issuer() != principal {
+    if !same_reference(root.credential().issuer(), principal) {
         return Err(DelegationError::RootNotPrincipal {
             root_issuer: root.credential().issuer().to_string(),
             expected: principal.to_string(),
