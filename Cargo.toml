@@ -34,7 +34,7 @@ tracing = "0.1"
 unicode-normalization = "0.1"
 
 [dev-dependencies]
-affinidi-tdk = "0.23"
+affinidi-tdk = "0.26"
 anyhow = "1.0"
 tokio = "1"
 # The `data_room` example seals records for real rather than pretending to. Dev-only:
