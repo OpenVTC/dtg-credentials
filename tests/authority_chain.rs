@@ -1010,3 +1010,129 @@ fn a_did_scid_party_is_matched_by_its_did() {
         "got {err:?}"
     );
 }
+
+// ─── Purposes of use (DTG Core Credentials, *Purposes of Use*) ──────────────────
+
+mod purposes {
+    use super::*;
+    use dtg_credentials::purposes::{MODEL_TRAINING, PurposeScope};
+
+    fn with(c: DTGCredential, p: PurposeScope) -> DTGCredential {
+        c.with_purposes(p).expect("a well-formed scope")
+    }
+
+    /// A chain stating no purposes grants `any`, as a VAC from before the member did.
+    #[test]
+    fn a_chain_stating_none_grants_any() {
+        let root = root_grant();
+        let agent = agent_grant(&root);
+        let v = verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)).unwrap();
+        assert_eq!(v.purposes, PurposeScope::Any);
+        assert!(!v.purposes.grants(MODEL_TRAINING));
+    }
+
+    /// The case the member exists for: a principal equips an agent for one task, and the
+    /// chain says so.
+    #[test]
+    fn an_agent_link_narrows_the_purposes_and_the_chain_reports_them() {
+        let root = with(
+            root_grant(),
+            PurposeScope::listed(["personalisation", "taskExecution"]),
+        );
+        let agent = with(agent_grant(&root), PurposeScope::listed(["taskExecution"]));
+        let v = verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)).unwrap();
+        assert_eq!(v.purposes, PurposeScope::listed(["taskExecution"]));
+    }
+
+    /// A link stating none takes its parent's.
+    #[test]
+    fn a_link_stating_none_inherits_its_parents() {
+        let root = with(root_grant(), PurposeScope::listed(["personalisation"]));
+        let agent = agent_grant(&root);
+        let v = verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)).unwrap();
+        assert_eq!(v.purposes, PurposeScope::listed(["personalisation"]));
+    }
+
+    /// Widening is refused, whichever way it is attempted.
+    #[test]
+    fn a_link_widening_its_parents_purposes_invalidates_the_chain() {
+        let root = with(root_grant(), PurposeScope::listed(["personalisation"]));
+        for (wider, beyond) in [
+            (PurposeScope::Any, vec!["any".to_string()]),
+            (
+                PurposeScope::listed(["personalisation", "analytics"]),
+                vec!["analytics".to_string()],
+            ),
+        ] {
+            let agent = with(agent_grant(&root), wider);
+            let err =
+                verify_chain(&[agent, root.clone()], ROOM, ROOM, "read", AGENT, t(1)).unwrap_err();
+            assert_eq!(
+                err,
+                AuthorityError::WidensPurposes {
+                    index: 0,
+                    purposes: beyond
+                }
+            );
+        }
+    }
+
+    /// `any` never includes model training, so a link beneath a root stating none cannot
+    /// state it; only a root naming it can pass it on.
+    #[test]
+    fn model_training_reaches_a_link_only_from_a_root_that_names_it() {
+        let root = root_grant();
+        let agent = with(agent_grant(&root), PurposeScope::listed([MODEL_TRAINING]));
+        assert!(matches!(
+            verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)),
+            Err(AuthorityError::WidensPurposes { .. })
+        ));
+
+        let root = with(root_grant(), PurposeScope::listed([MODEL_TRAINING]));
+        let agent = agent_grant(&root);
+        let v = verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)).unwrap();
+        assert!(v.purposes.grants(MODEL_TRAINING));
+    }
+
+    /// `with_purposes_under` refuses at issue what the verifier would refuse at use, where
+    /// the parent states its purposes.
+    #[test]
+    fn attenuation_refuses_wider_purposes_at_issue() {
+        let root = with(root_grant(), PurposeScope::listed(["personalisation"]));
+        let err = agent_grant(&root)
+            .with_purposes_under(&root, PurposeScope::Any)
+            .unwrap_err();
+        assert!(
+            matches!(err, DTGCredentialError::AttenuationWidens(_)),
+            "{err:?}"
+        );
+    }
+
+    /// The member is defined by context v2: stating it lists v2 second, and a VAC stating
+    /// it under v1 is refused at parse.
+    #[test]
+    fn a_vac_stating_purposes_lists_context_v2_and_v1_refuses_it() {
+        let vac = with(root_grant(), PurposeScope::listed(["analytics"]));
+        let mut json = serde_json::to_value(vac.credential()).unwrap();
+        assert_eq!(json["@context"][1], dtg_credentials::DTG_CONTEXT_V2);
+        assert_eq!(
+            json["credentialSubject"]["purposes"],
+            serde_json::json!({ "scope": "listed", "purposes": ["analytics"] })
+        );
+        assert!(DTGCredential::try_from(json.clone()).is_ok(), "v2 parses");
+
+        json["@context"][1] = serde_json::json!(dtg_credentials::DTG_CONTEXT_V1);
+        assert!(
+            DTGCredential::try_from(json.clone()).is_err(),
+            "purposes under v1"
+        );
+
+        json["@context"][1] = serde_json::json!(dtg_credentials::DTG_CONTEXT_V2);
+        json["credentialSubject"]["purposes"] =
+            serde_json::json!({ "scope": "listed", "purposes": [] });
+        assert!(
+            DTGCredential::try_from(json).is_err(),
+            "an empty list is not any"
+        );
+    }
+}

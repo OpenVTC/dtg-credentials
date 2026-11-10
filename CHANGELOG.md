@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A VAC states purposes of use** (DTG Core Credentials, *Purposes of Use*;
+  trustoverip/dtgwg-cred-spec#84). `credentialSubject.purposes` is optional, `{"scope":"any"}`
+  or `{"scope":"listed","purposes":[...]}` with a non-empty list of registered names or
+  absolute IRIs, each once; absent means `any`, and `any` never grants `modelTraining`.
+  `dtg_credentials::purposes::PurposeScope` models it, read strictly (an `any` carrying
+  `purposes`, an empty list or a duplicate is refused at parse). A VAC stating it lists
+  `DTG_CONTEXT_V2` (`https://registry.trustoverip.org/dtg/context/v2`) second, which is now
+  recognized beside `v1`; a VAC stating it under `v1` is refused.
+- **`verify_chain` enforces the chain rule and reports the effective purposes.** A link
+  stating none takes its parent's; a link stating purposes its parent does not grant is
+  `AuthorityError::WidensPurposes`. The root states the grant, so only a root naming
+  `modelTraining` can pass it on. `VerifiedAuthority::purposes` carries the result.
+- `DTGCredential::with_purposes` states them (switching the context to `v2`), and
+  `with_purposes_under` refuses at issue purposes wider than those the parent states.
+
+### Changed (breaking)
+
+- `CredentialSubjectAuthority` gains `purposes`, `VerifiedAuthority` gains `purposes`, and
+  `AuthorityError` gains `WidensPurposes`; `DTGCredentialError` gains `InvalidPurposes`
+  (non-exhaustive).
+
 - **did:scid parties are matched by their DID.** Chain verification (`verify_chain`,
   delegation chains) and the acknowledgement/acceptance pairing compare an issuer,
   subject, presenter, governing party or principal by DID, ignoring a did:scid `?src=`

@@ -20,6 +20,7 @@ pub mod accept;
 pub mod authority;
 pub mod create;
 pub mod delegation;
+pub mod purposes;
 pub mod statement;
 
 pub use accept::{
@@ -51,6 +52,14 @@ pub const W3C_VC_V1_CONTEXT: &str = "https://www.w3.org/2018/credentials/v1";
 /// other IRIs — `https://firstperson.network/credentials/dtg/v1` among them — are not
 /// recognized. A credential listing one is refused at parse rather than aliased.
 pub const DTG_CONTEXT_V1: &str = "https://registry.trustoverip.org/dtg/context/v1";
+
+/// The DTG credential context, version 2: [DTG_CONTEXT_V1] and the VAC's `purposes`
+/// (DTG Core Credentials, *Purposes of Use*).
+///
+/// A VAC stating `purposes` lists this one second, since `v1` is frozen and does not define
+/// the member; a credential carrying no member `v2` added MAY continue to list `v1`. Both
+/// are recognized, and nothing else is.
+pub const DTG_CONTEXT_V2: &str = "https://registry.trustoverip.org/dtg/context/v2";
 
 /// The correlation scope an issuer declares for its own identifier, carried as the
 /// REQUIRED top-level `issuerScope` of every DTG credential (DTG Core Credentials
@@ -229,9 +238,15 @@ pub enum DTGCredentialError {
     #[error("taskContext is required here, and so is taskDigestMultibase, which is absent")]
     MissingTaskDigest,
 
-    /// `@context` does not list the W3C VC context first and [DTG_CONTEXT_V1] second.
+    /// `@context` does not list the W3C VC context first and [DTG_CONTEXT_V1] or
+    /// [DTG_CONTEXT_V2] second, or a VAC states `purposes` under `v1`.
     #[error("malformed @context: {0}")]
     InvalidContext(String),
+
+    /// A VAC's `purposes` is not a well-formed purpose scope: an empty list, a purpose
+    /// named twice, or one that is neither a registered name nor an absolute IRI.
+    #[error("malformed purposes: {0}")]
+    InvalidPurposes(String),
 
     /// `type` is not `VerifiableCredential`, `DTGCredential` and exactly one concrete
     /// subtype (with `PersonhoodCredential` permitted as a hint on a VMC only), or names a
@@ -825,6 +840,16 @@ impl DTGCredential {
                     // Emptiness is never a wildcard. Refusing here means a caller cannot
                     // construct one by deserialization either.
                     return Err(DTGCredentialError::EmptyAuthorityActions);
+                }
+                if let Some(scope) = &subject.purposes {
+                    scope.check().map_err(DTGCredentialError::InvalidPurposes)?;
+                    // `v1` is frozen and defines no `purposes`: a VAC stating them lists the
+                    // context that does.
+                    if c.context.get(1).map(String::as_str) != Some(DTG_CONTEXT_V2) {
+                        return Err(DTGCredentialError::InvalidContext(format!(
+                            "a VAC stating `purposes` lists `{DTG_CONTEXT_V2}` second"
+                        )));
+                    }
                 }
             }
             (DTGCredentialType::Delegation, CredentialSubject::Delegation(subject)) => {
@@ -1457,9 +1482,9 @@ fn check_context(context: &[String]) -> Result<W3CVCVersion, DTGCredentialError>
         _ => return Err(DTGCredentialError::UnknownVCVersion),
     };
     match context.get(1).map(String::as_str) {
-        Some(DTG_CONTEXT_V1) => Ok(version),
+        Some(DTG_CONTEXT_V1 | DTG_CONTEXT_V2) => Ok(version),
         Some(other) => Err(DTGCredentialError::InvalidContext(format!(
-            "second entry is `{other}`, not `{DTG_CONTEXT_V1}`"
+            "second entry is `{other}`, not `{DTG_CONTEXT_V1}` or `{DTG_CONTEXT_V2}`"
         ))),
         None => Err(DTGCredentialError::InvalidContext(format!(
             "`{DTG_CONTEXT_V1}` is not listed second"
@@ -2126,6 +2151,12 @@ pub struct CredentialSubjectAuthority {
 
     /// What the subject may do, and where.
     pub authority: AuthorityGrant,
+
+    /// What the subject may use content it obtains under this authority **for**
+    /// (DTG Core Credentials, *Purposes of Use*). `None` states none: a root stating none
+    /// grants `any`, and a link stating none takes its parent's. Requires [DTG_CONTEXT_V2].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purposes: Option<purposes::PurposeScope>,
 }
 
 /// Membership Credential subject

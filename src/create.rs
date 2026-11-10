@@ -548,6 +548,7 @@ impl DTGCredential {
                     parent: None,
                     max_attenuation: None,
                 },
+                purposes: None,
             }),
         ))
     }
@@ -638,6 +639,65 @@ impl DTGCredential {
             .ok_or(DTGCredentialError::NotAnAuthorityCredential)?
             .max_attenuation = Some(max_attenuation);
         Ok(self)
+    }
+
+    /// States `purposes` on a VAC: what its subject may use content it obtains under the
+    /// authority for (DTG Core Credentials, *Purposes of Use*). Lists [crate::DTG_CONTEXT_V2]
+    /// second, which defines the member.
+    ///
+    /// On a link this library attenuated, the purposes must be within the parent's
+    /// effective purposes — a link MUST NOT widen them — and this refuses ones wider than
+    /// purposes the parent states itself. A parent that states none takes its own parent's,
+    /// which this credential cannot see, so [crate::authority::verify_chain] remains the
+    /// authority on the chain rule.
+    ///
+    /// # Set it before signing
+    ///
+    /// Same caveat as [DTGCredential::with_id].
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::NotAnAuthorityCredential] on anything but a VAC, and
+    /// [DTGCredentialError::InvalidPurposes] for a malformed scope.
+    pub fn with_purposes(
+        mut self,
+        purposes: crate::purposes::PurposeScope,
+    ) -> Result<Self, DTGCredentialError> {
+        purposes
+            .check()
+            .map_err(DTGCredentialError::InvalidPurposes)?;
+        match &mut self.credential.credential_subject {
+            CredentialSubject::Authority(subject) => subject.purposes = Some(purposes),
+            _ => return Err(DTGCredentialError::NotAnAuthorityCredential),
+        }
+        if let Some(second) = self.credential.context.get_mut(1) {
+            *second = crate::DTG_CONTEXT_V2.to_string();
+        }
+        Ok(self)
+    }
+
+    /// [DTGCredential::with_purposes] on a link attenuated from `parent`, refusing purposes
+    /// wider than those `parent` states.
+    ///
+    /// # Errors
+    ///
+    /// As [DTGCredential::with_purposes], and [DTGCredentialError::AttenuationWidens] where
+    /// `parent` states purposes these are not within.
+    pub fn with_purposes_under(
+        self,
+        parent: &DTGCredential,
+        purposes: crate::purposes::PurposeScope,
+    ) -> Result<Self, DTGCredentialError> {
+        if let CredentialSubject::Authority(p) = &parent.credential.credential_subject
+            && let Some(stated) = &p.purposes
+            && !purposes.is_within(stated)
+        {
+            return Err(DTGCredentialError::AttenuationWidens(format!(
+                "purposes {:?} are wider than the parent's",
+                purposes.beyond(stated)
+            )));
+        }
+        self.with_purposes(purposes)
     }
 
     /// Derive a narrower VAC from one this holder already holds.
@@ -865,6 +925,9 @@ impl DTGCredential {
                     parent: Some(parent_digest),
                     max_attenuation,
                 },
+                // A link stating none takes its parent's; state narrower ones with
+                // [DTGCredential::with_purposes].
+                purposes: None,
             }),
         ))
     }
