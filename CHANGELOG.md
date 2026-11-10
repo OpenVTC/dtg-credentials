@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-10
+
+**Breaking:** a VAC states purposes of use (DTG Core Credentials, context `v2`), and
+`verify_chain` holds a chain to them — see *Changed (breaking)* below.
+
 ### Added
 
 - **A VAC states purposes of use** (DTG Core Credentials, *Purposes of Use*;
