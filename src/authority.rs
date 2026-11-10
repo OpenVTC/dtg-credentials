@@ -103,6 +103,17 @@ pub enum AuthorityError {
     #[error("authority chain is empty")]
     EmptyChain,
 
+    /// A link states purposes its parent's effective purposes do not grant — `any`
+    /// beneath a list, a purpose the list does not name, or `modelTraining` its parent
+    /// does not name (DTG Core Credentials, *Purposes of Use*).
+    #[error("chain link {index} states purposes {purposes:?} its parent does not grant")]
+    WidensPurposes {
+        /// Position in the chain, leaf first.
+        index: usize,
+        /// The purposes beyond the parent's, or `["any"]`.
+        purposes: Vec<String>,
+    },
+
     /// A link's digest could not be computed, or one it carries could not be read.
     ///
     /// Distinct from [AuthorityError::BrokenLink]: a digest that cannot be *read* is not a
@@ -291,6 +302,10 @@ pub struct VerifiedAuthority {
     pub actions: Vec<String>,
     /// The party governing the scope, which issued the chain root.
     pub governing_party: String,
+    /// The chain's **effective purposes**: what the presented VAC states, or, where it
+    /// states none, what the nearest link above it that does states — `any` where none
+    /// does. A verifier holds a content-disclosing request to these (*Purposes of Use*).
+    pub purposes: crate::purposes::PurposeScope,
 }
 
 /// Verify a chain of VACs and return what it permits.
@@ -509,6 +524,28 @@ pub fn verify_chain(
         });
     }
 
+    // Purposes, root to leaf: a link stating none takes its parent's, and a link stating
+    // purposes its parent does not grant invalidates the chain, as a widened action does.
+    let mut effective = crate::purposes::PurposeScope::Any;
+    for index in (0..chain.len()).rev() {
+        let stated = match &chain[index].credential().credential_subject {
+            crate::CredentialSubject::Authority(subject) => subject.purposes.as_ref(),
+            _ => None,
+        };
+        if let Some(stated) = stated {
+            // The root has no parent: what the governing party states is the grant, and
+            // only it can name `modelTraining` for every link beneath.
+            let is_root = index == chain.len() - 1;
+            if !is_root && !stated.is_within(&effective) {
+                return Err(AuthorityError::WidensPurposes {
+                    index,
+                    purposes: stated.beyond(&effective),
+                });
+            }
+            effective = stated.clone();
+        }
+    }
+
     // Finally, what was asked for.
     if leaf_grant.scope != requested_scope {
         return Err(AuthorityError::ScopeMismatch {
@@ -527,5 +564,6 @@ pub fn verify_chain(
         scope: leaf_grant.scope.clone(),
         actions: leaf_grant.actions.clone(),
         governing_party: governing_party.to_string(),
+        purposes: effective,
     })
 }
