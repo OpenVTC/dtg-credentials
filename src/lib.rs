@@ -1,5 +1,5 @@
 /*! Decentralized Trust Graph (DTG) Credentials
-*/
+ */
 
 use affinidi_data_integrity::DataIntegrityProof;
 #[cfg(feature = "affinidi-signing")]

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **Moved to the affinidi-tdk 0.49 generation.** `affinidi-data-integrity` 0.8 → 0.9,
+  `affinidi-secrets-resolver` 0.5 → 0.6 and `affinidi-did-common` 0.4 → 0.5, with the
+  `affinidi-tdk` dev-dependency 0.36 → 0.49. Types from `affinidi-data-integrity` and
+  `affinidi-secrets-resolver` (`DataIntegrityProof`, `SignOptions`, `VerifyOptions`,
+  `Secret`) appear in this crate's API, so a caller has to move to the same generation.
+  The tree now holds one `affinidi-crypto` (0.4) and one DID-crate generation; before,
+  `trust-tasks-proof` pulled a second set in through the dev-dependency, which is why the
+  automated `affinidi-tdk` 0.37 bump (#46) failed to build.
+
 ## [0.14.0] - 2026-11-10
 
 **Breaking:** a VAC states purposes of use (DTG Core Credentials, context `v2`), and

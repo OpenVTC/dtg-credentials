@@ -1,6 +1,6 @@
 /*!
-*   Builder methods for creating new entities.
-*/
+ *   Builder methods for creating new entities.
+ */
 
 use crate::{
     AuthorityGrant, CredentialSubject, CredentialSubjectAuthority, CredentialSubjectBasic,
