@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Breaking:** `new_vmc` and `new_community_role_vac` take an `IssuerScope`, and a
+community-issued VMC may now declare `directed` — upgrade verifiers before issuers emit
+it. See *Changed (breaking)* below and README *Upgrading*.
+
+### Added
+
+- **Salting under context v3, behind the `context-v3` feature (off by default)**
+  (DTG Core Credentials Working Draft 0.7.0, *Base Structure* and *Digest Encoding —
+  Salting*; trustoverip/dtgwg-cred-spec#87). With the feature on, every constructor lists
+  `DTG_CONTEXT_V3` (`https://registry.trustoverip.org/dtg/context/v3`) second and draws a
+  `salt` of `SALT_LEN` (32) fresh random bytes, base-58-btc multibase, when the credential
+  is built — so re-proofing keeps it and re-issuing draws a new one. A parse accepts `v3`
+  only with a salt decoding to exactly 32 bytes. `with_purposes` keeps `v3`, which defines
+  `purposes` as `v2` does. The feature is off because the registry has not yet published
+  `contexts/v3.jsonld`, and until its digest is recorded issuers MUST NOT emit `salt`:
+  enable it on verifiers first, and on issuers only once `v3` is published. The salt is
+  drawn with `rand` (already in the dependency graph), an optional dependency of the
+  feature.
+- `DTGCommon::salt`, `SALT_LEN`, and `DTGCredentialError::InvalidSalt`.
+
+### Changed (breaking)
+
+- **A community's grant is `directed` at minimum** (DTG Core Credentials, *Correlation
+  Scope* and *VMC*; trustoverip/dtgwg-cred-spec#86). A community-issued VMC may declare
+  `directed` or `public` — `public` where the community is open to outsiders — and only
+  `pairwise` is refused (`IssuerScopeTooNarrow { minimum: Directed }`, before:
+  `minimum: Public`). `new_member_vmc_for` acknowledges a `directed` grant.
+- **`new_vmc(issuer, issuer_scope, subject, …)`** and
+  **`new_community_role_vac(community, issuer_scope, member, …)`** take the community's
+  declaration as a new second parameter; `new_community_role_vac` refuses `pairwise`
+  with `IssuerScopeTooNarrow`. Pass `IssuerScope::Public` to keep 0.15 behaviour.
+- **A `salt` under context v1 or v2 is refused** (`InvalidSalt`) in every build, feature
+  on or off: neither context defines it. Before, it passed through `DTGCommon::extra`.
+- `DTGCommon` gains the `salt` field.
+
+### Documentation
+
+- README states Working Draft 0.7.0: contexts v1 and v2 supported, v3 pending.
+- "member VTC" wording in `new_vmc`/`new_vic` now reads VTC or VTN, after
+  trustoverip/dtgwg-cred-spec#83.
+
 ## [0.15.0] - 2026-11-24
 
 **Breaking:** moves to the affinidi-tdk 0.49 generation — see *Changed (breaking)* below.

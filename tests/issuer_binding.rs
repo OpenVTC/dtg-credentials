@@ -12,7 +12,9 @@
 use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
 use affinidi_secrets_resolver::secrets::Secret;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use dtg_credentials::{DTGCredential, DTGCredentialError, verify_grant_with_public_key};
+use dtg_credentials::{
+    DTGCredential, DTGCredentialError, IssuerScope, verify_grant_with_public_key,
+};
 use serde_json::{Value, json};
 
 const ISSUER: &str = "did:example:community";
@@ -30,7 +32,14 @@ fn key(method: &str) -> Secret {
 
 /// A membership grant from [ISSUER], signed with `signer`.
 async fn signed(signer: &Secret) -> DTGCredential {
-    let mut vmc = DTGCredential::new_vmc(ISSUER.into(), SUBJECT.into(), t(0), None, false);
+    let mut vmc = DTGCredential::new_vmc(
+        ISSUER.into(),
+        IssuerScope::Public,
+        SUBJECT.into(),
+        t(0),
+        None,
+        false,
+    );
     vmc.sign(signer, Some(t(0))).await.expect("signs");
     vmc
 }
@@ -128,6 +137,7 @@ async fn an_object_form_issuer_is_bound_by_its_id() {
     let unsigned = |issuer: Value| {
         let mut wire = serde_json::to_value(DTGCredential::new_vmc(
             ISSUER.into(),
+            IssuerScope::Public,
             SUBJECT.into(),
             t(0),
             None,

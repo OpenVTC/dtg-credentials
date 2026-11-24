@@ -243,6 +243,7 @@ async fn main() -> Result<()> {
     // (or room) cannot assert a membership the member never agreed to.
     let mut grant = DTGCredential::new_vmc(
         room_did.clone(),
+        IssuerScope::Public,
         bob_did.clone(),
         now,
         Some(now + Duration::days(30)),

@@ -161,7 +161,14 @@ fn a_credential_status_beyond_the_bound_is_refused() {
 
 #[test]
 fn an_unmodelled_member_beyond_the_bound_is_refused() {
-    let mut vmc = DTGCredential::new_vmc(ISSUER.into(), SUBJECT.into(), t0(), None, false);
+    let mut vmc = DTGCredential::new_vmc(
+        ISSUER.into(),
+        IssuerScope::Public,
+        SUBJECT.into(),
+        t0(),
+        None,
+        false,
+    );
     vmc.credential_mut()
         .extra
         .insert("evidence".into(), deep(MAX_JSON_DEPTH));
@@ -176,6 +183,7 @@ fn an_unmodelled_member_beyond_the_bound_is_refused() {
 fn a_deep_document_is_refused_without_exhausting_the_stack() {
     let mut doc = serde_json::to_value(DTGCredential::new_vmc(
         ISSUER.into(),
+        IssuerScope::Public,
         SUBJECT.into(),
         t0(),
         None,
@@ -272,6 +280,7 @@ fn answering_a_deep_grant_is_refused_without_exhausting_the_stack() {
 
     let mut membership = serde_json::to_value(DTGCredential::new_vmc(
         ISSUER.into(),
+        IssuerScope::Public,
         SUBJECT.into(),
         t0(),
         Some(until),
@@ -394,7 +403,14 @@ mod signing {
     #[tokio::test]
     async fn verifying_a_deep_grant_is_refused_without_exhausting_the_stack() {
         let secret = Secret::generate_ed25519(Some(&format!("{ISSUER}#key-1")), None);
-        let mut grant = DTGCredential::new_vmc(ISSUER.into(), SUBJECT.into(), t0(), None, false);
+        let mut grant = DTGCredential::new_vmc(
+            ISSUER.into(),
+            IssuerScope::Public,
+            SUBJECT.into(),
+            t0(),
+            None,
+            false,
+        );
         grant.sign(&secret, None).await.expect("signs");
 
         let mut grant = serde_json::to_value(&grant).unwrap();
@@ -413,7 +429,14 @@ mod signing {
     #[tokio::test]
     async fn verification_refuses_a_deep_member() {
         let secret = Secret::generate_ed25519(None, None);
-        let mut vmc = DTGCredential::new_vmc(ISSUER.into(), SUBJECT.into(), t0(), None, false);
+        let mut vmc = DTGCredential::new_vmc(
+            ISSUER.into(),
+            IssuerScope::Public,
+            SUBJECT.into(),
+            t0(),
+            None,
+            false,
+        );
         vmc.sign(&secret, None).await.expect("signs");
 
         vmc.set_credential_status(deep(MAX_JSON_DEPTH));

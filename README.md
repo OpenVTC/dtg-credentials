@@ -2,15 +2,18 @@
 
 **_NOTE:_** This is an early implementation of the [DTG Core Credentials
 specification](https://github.com/trustoverip/dtgwg-cred-spec) (v1.0, Document
-Status Working Draft 0.6.0), using the frozen v1 credential context
-`https://registry.trustoverip.org/dtg/context/v1` published by the DTG VSC
-Predicate Registry.
+Status Working Draft 0.7.0). It supports the frozen credential contexts v1
+(`https://registry.trustoverip.org/dtg/context/v1`) and v2
+(`https://registry.trustoverip.org/dtg/context/v2`) published by the DTG VSC
+Predicate Registry. Context v3, which adds the `salt` every credential carries, is
+**pending** its publication by the registry; support for it is implemented behind the
+off-by-default `context-v3` cargo feature — see [Salting (context v3)](#salting-context-v3).
 
 See the [First Person Project Whitepaper](https://www.firstperson.network/white-paper)
 for more information.
 
 This library issues W3C VC 2.0 credentials and also parses 1.1 ones (the spec's
-legacy compatibility profile), provided they list the DTG v1 context second.
+legacy compatibility profile), provided they list a recognized DTG context second.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -70,8 +73,8 @@ Every credential this library emits looks like this:
 }
 ```
 
-A parse refuses anything else: the W3C context first and the DTG v1 context second
-(compared as exact strings — the pre-v1 `https://firstperson.network/credentials/dtg/v1`
+A parse refuses anything else: the W3C context first and the DTG v1 or v2 context second
+(v3 too, under the `context-v3` feature; compared as exact strings — the pre-v1 `https://firstperson.network/credentials/dtg/v1`
 is not recognized), `type` holding `VerifiableCredential`, `DTGCredential` and **exactly
 one** concrete subtype, with `PersonhoodCredential` allowed only as a non-authoritative
 hint on a VMC, and a REQUIRED `issuerScope`.
@@ -105,10 +108,17 @@ let vrc = DTGCredential::new_vrc(alice_pairwise, IssuerScope::Pairwise, bob_pair
 assert!(IssuerScope::Public.satisfies(IssuerScope::Directed));
 ```
 
-Every constructor takes it explicitly, except where the specification fixes it: a
-community-issued VMC is always `public` (a community that cannot be found cannot be
-joined), so `new_vmc` sets it and a grant declaring anything else is refused at parse.
-`new_community_role_vac` fixes `public` for the same reason. Profiles may set a minimum:
+Every constructor takes it explicitly. Some credentials set a minimum. A community's own
+identifier is `directed` at minimum — it must be resolvable by every party verifying its
+members' credentials, and a community has more than one member — and `public` where the
+community is open to outsiders. So `new_vmc` and `new_community_role_vac` take the
+community's declaration, a grant declaring `pairwise` is refused by `validate()`/`sign()`
+and at parse, and `new_community_role_vac` refuses `pairwise` outright. An open
+community (a public project, a company) ordinarily declares `public`; a restricted one (a
+family, a support group) is ordinarily better served by `directed`, since its identifier
+is disclosed in every proof of membership in it. A VIC issued by the community itself
+carries the same declaration, but nothing in a VIC says whether its issuer is the
+community, so that one is the issuer's to get right. Profiles may set a minimum too:
 `witnessed/1`, `vetted/1` and `presented/1` refuse `pairwise`.
 
 ## Statements (VSC)
@@ -298,7 +308,7 @@ Membership is a **pair** of VMCs, not a single directed credential:
 
 | | `issuer` | `issuerScope` | `credentialSubject.id` | `digestMultibase` |
 | --- | --- | --- | --- | --- |
-| **Community-issued** (the grant) | community | `public`, always | member | MUST be absent |
+| **Community-issued** (the grant) | community | `directed` at minimum; `public` if open to outsiders | member | MUST be absent |
 | **Member-issued** (the acknowledgement) | member | the member's choice | community | MUST be present |
 
 The member-issued half is the member's *consent artifact*. A community can
@@ -310,7 +320,7 @@ acknowledgement is visibly asserting a membership nobody agreed to.
 ```Rust
 // Community side: grant membership.
 let grant = DTGCredential::new_vmc(
-  community_did, member_did, valid_from, valid_until, personhood,
+  community_did, IssuerScope::Public, member_did, valid_from, valid_until, personhood,
 ).with_id(format!("urn:uuid:{}", Uuid::new_v4()));
 grant.sign(&community_key, None).await?;
 
@@ -423,8 +433,9 @@ so it is a VAC the community issues: `scope` the community's own DID, `actions` 
 
 ```Rust
 let vetter = DTGCredential::new_community_role_vac(
-  community_did.clone(), member_did.clone(), "vetter", now, now + Duration::days(90),
-)?;   // issuerScope "public"; authority { scope: community_did, actions: ["role:vetter"] }
+  community_did.clone(), IssuerScope::Directed, member_did.clone(), "vetter",
+  now, now + Duration::days(90),
+)?;   // issuerScope "directed"; authority { scope: community_did, actions: ["role:vetter"] }
 
 verify_chain(&[vetter], &community_did, &community_did, "role:vetter", &member_did, now)?;
 ```
@@ -515,6 +526,39 @@ not present, which is what keeps re-delegation working.
 Not implemented here: revocation — `credentialStatus` is modelled and settable, but
 never resolved.
 
+## Salting (context v3)
+
+DTG Core Credentials (Working Draft 0.7.0, *Base Structure* and *Digest Encoding —
+Salting*) gives every credential a top-level `salt`, so that a digest referencing it —
+an acknowledgement, an acceptance, a statement about it, a child in a chain — cannot be
+reversed by trying plausible content. `salt` is defined by context **v3**, which the
+registry has not yet published; until its digest is recorded the specification says
+issuers MUST NOT emit it. So this library implements it behind a cargo feature that is
+**off by default**:
+
+```toml
+dtg-credentials = { version = "0.16", features = ["context-v3"] }
+```
+
+| | Feature off (default) | Feature `context-v3` on |
+| --- | --- | --- |
+| Constructors list second | `v1` (`v2` for a VAC stating `purposes`) | `DTG_CONTEXT_V3` (`https://registry.trustoverip.org/dtg/context/v3`) |
+| `salt` on new credentials | none | 32 fresh random bytes, base-58-btc multibase (`z…`), drawn in the constructor |
+| A `v3` credential at parse | refused (`InvalidContext`) | accepted only with a `salt` decoding to exactly 32 bytes (`InvalidSalt` otherwise) |
+| A `salt` under `v1`/`v2` | refused (`InvalidSalt`) | refused (`InvalidSalt`) |
+| `v1`/`v2` credentials without a salt | accepted | accepted |
+
+The salt is drawn when the credential is **built**, not when it is signed: re-proofing a
+credential (`sign()` again, or another backend signing after `validate()`) keeps its
+salt and so its digest, while building it again — re-issuing — draws a new salt and a new
+digest. `DTGCommon::salt` carries it; do not copy one between credentials. Where a
+selective-disclosure suite is used, `salt` MUST be a mandatory-disclosure member; this
+library has no selective-disclosure path of its own.
+
+**Rollout: verifiers first.** Enable `context-v3` on every verifier before any issuer,
+and on issuers only once `v3` is published — a verifier without the feature refuses
+every v3 credential.
+
 ## Upgrading
 
 **Upgrade verifiers before issuers.** Both directions of a version skew are errors,
@@ -550,6 +594,7 @@ worth stating for each breaking release:
 | 0.10.0 (first published in 0.11.0) | Validity-window and JSON-depth checks at issue and verify; `DTGCredentialError` is `#[non_exhaustive]` | Verifiers first |
 | 0.11.0 | `taskDigestMultibase` added; `DTGCommon` gains a field; `new_vwc` deprecated | Any order |
 | 0.12.0 | v1 context IRI; `issuerScope` REQUIRED; `StatementCredential` replaces VEC/VWC; `maxAttenuation` | **Both at once** — see below |
+| 0.16.0 | A community-issued VMC may declare `directed`; `new_vmc`/`new_community_role_vac` take an `IssuerScope`; a `salt` under v1/v2 is refused; v3 salting behind `context-v3` | Upgrade verifiers before issuers emit `directed` (and before any issuer enables `context-v3`) |
 
 Every one through 0.10.0 is *verifiers first*, and for the same reason: each made a
 verifier stricter or changed what it reads, so a verifier that moves first accepts
@@ -567,6 +612,15 @@ credential a 0.11 issuer emits (pre-v1 context, no `issuerScope`, retired types)
 conformant, so there is no compatibility mode to stage through. Upgrade the issuers and
 verifiers of one deployment together, and re-issue the credentials they hold: grants,
 acknowledgements, VACs and VDCs alike, since every digest changes with the new members.
+
+**0.16.0 is verifiers first, twice over.** A 0.15 verifier refuses a community-issued
+grant declaring `directed` (`IssuerScopeTooNarrow`), and a 0.15 member's
+`new_member_vmc_for` refuses to acknowledge one — so move every verifier and member
+client to 0.16 before any community issues a `directed` grant. Communities that keep
+declaring `public` change nothing on the wire. The same holds, more strictly, for
+`context-v3`: a verifier built without the feature refuses every v3 credential, so turn
+it on for verifiers first and for issuers only once the registry has published
+`contexts/v3.jsonld` and the specification has recorded its digest.
 
 `0.8.0` and `0.9.1` are API breaks rather than wire changes — no credential changes
 shape — but they land in the same place: a caller that upgrades gets a compile error
@@ -614,7 +668,7 @@ choice for a credential with no dereferenceable home.
 The `new_*()` constructors leave it unset. Chain `with_id()` to add one:
 
 ```Rust
-let vmc = DTGCredential::new_vmc(issuer, subject, valid_from, valid_to, false)
+let vmc = DTGCredential::new_vmc(issuer, IssuerScope::Public, subject, valid_from, valid_to, false)
   .with_id(format!("urn:uuid:{}", Uuid::new_v4()));
 
 assert_eq!(vmc.id(), Some(...));
@@ -738,7 +792,7 @@ let credential = vrc.credential();
 You can determine the credential type easily using:
 
 ```Rust
-let vmc = DTGCredential::new_vmc(issuer, subject, valid_from, valid_to, false);
+let vmc = DTGCredential::new_vmc(issuer, IssuerScope::Public, subject, valid_from, valid_to, false);
 
 if vmc.type_() == DTGCredentialType::Membership {
   // Good
@@ -748,7 +802,7 @@ if vmc.type_() == DTGCredentialType::Membership {
 Has this Credential been signed?
 
 ```Rust
-let vmc = DTGCredential::new_vmc(issuer, subject, valid_from, valid_to, false);
+let vmc = DTGCredential::new_vmc(issuer, IssuerScope::Public, subject, valid_from, valid_to, false);
 
 if vmc.signed() {
   println!("Credential has been signed");
