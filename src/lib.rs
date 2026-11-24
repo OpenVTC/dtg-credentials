@@ -3400,6 +3400,7 @@ mod tests {
 
     /// The superseded encoding still produces what it always did, so a caller migrating can
     /// recompute a Working Draft 01 digest to compare against one they stored.
+    #[cfg(not(feature = "context-v3"))] // pins the v1 wire form
     #[test]
     #[allow(deprecated)]
     fn the_superseded_hex_digest_is_unchanged() {

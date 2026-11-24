@@ -242,19 +242,26 @@ fn a_grant_its_own_subject_wrote_satisfies_the_member_check() {
     );
 }
 
-/// A community-issued grant is `public`, so a grant declaring anything else is not one to
+/// A community-issued grant is `directed` at minimum, so a `pairwise` grant is not one to
 /// acknowledge — and the acknowledgement declares the member's own scope, not the grant's.
 #[test]
-fn the_grant_must_be_public_and_the_acknowledgement_declares_the_members_scope() {
+fn the_grant_is_directed_at_minimum_and_the_acknowledgement_declares_the_members_scope() {
     let grant = unsigned_grant(COMMUNITY, MEMBER, None);
     let ack = DTGCredential::new_member_vmc_for(&grant, MEMBER, IssuerScope::Pairwise, t(1), None)
         .expect("builds");
     assert_eq!(ack.issuer_scope(), IssuerScope::Pairwise);
 
+    // A restricted community declares `directed`; its member acknowledges as before.
     let mut directed = grant.clone();
     directed["issuerScope"] = json!("directed");
+    let ack = DTGCredential::new_member_vmc_for(&directed, MEMBER, IssuerScope::Public, t(1), None)
+        .expect("a directed grant is acknowledged");
+    assert_eq!(ack.issuer_scope(), IssuerScope::Public);
+
+    let mut pairwise = grant.clone();
+    pairwise["issuerScope"] = json!("pairwise");
     assert!(matches!(
-        DTGCredential::new_member_vmc_for(&directed, MEMBER, IssuerScope::Directed, t(1), None),
+        DTGCredential::new_member_vmc_for(&pairwise, MEMBER, IssuerScope::Directed, t(1), None),
         Err(DTGCredentialError::NotAMembershipGrant(_))
     ));
 

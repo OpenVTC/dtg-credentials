@@ -1814,9 +1814,12 @@ mod tests {
         };
         let mut in_place = build();
         in_place.set_id("urn:uuid:abc");
+        let mut chained = build().with_id("urn:uuid:abc");
+        // Each build draws its own salt under `context-v3`; the comparison is of the id.
+        chained.credential_mut().salt = in_place.credential().salt.clone();
         assert_eq!(
             serde_json::to_value(&in_place).unwrap(),
-            serde_json::to_value(build().with_id("urn:uuid:abc")).unwrap()
+            serde_json::to_value(chained).unwrap()
         );
     }
 
