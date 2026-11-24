@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-24
+
 **Breaking:** `new_vmc` and `new_community_role_vac` take an `IssuerScope`, and a
 community-issued VMC may now declare `directed` — upgrade verifiers before issuers emit
 it. See *Changed (breaking)* below and README *Upgrading*.
