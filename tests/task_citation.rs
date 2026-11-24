@@ -105,15 +105,22 @@ fn witness_session() -> Value {
 }
 
 /// Alice's half of the relationship edge the witness observes her issue.
+///
+/// Built once: under `context-v3` every build draws a fresh salt, and so is a different
+/// credential with a different digest — re-issuing is exactly what a salt tells apart.
 fn alices_vrc() -> Value {
-    serde_json::to_value(DTGCredential::new_vrc(
-        ALICE.into(),
-        IssuerScope::Pairwise,
-        BOB.into(),
-        t0(),
-        None,
-    ))
-    .unwrap()
+    static VRC: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    VRC.get_or_init(|| {
+        serde_json::to_value(DTGCredential::new_vrc(
+            ALICE.into(),
+            IssuerScope::Pairwise,
+            BOB.into(),
+            t0(),
+            None,
+        ))
+        .unwrap()
+    })
+    .clone()
 }
 
 fn vwc_for(session: &Value) -> Result<DTGCredential, DTGCredentialError> {
