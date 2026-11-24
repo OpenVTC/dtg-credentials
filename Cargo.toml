@@ -13,6 +13,11 @@ repository = "https://github.com/OpenVTC/dtg-credentials"
 [features]
 default = ["affinidi-signing"]
 affinidi-signing = ["dep:affinidi-secrets-resolver"]
+# DTG credential context v3: every credential carries a 32-byte `salt` (DTG Core
+# Credentials, *Salting*). OFF by default: the registry has not yet published
+# `contexts/v3.jsonld`, and until its digest is recorded the specification says issuers
+# MUST NOT emit `salt`. Enable it on verifiers before any issuer.
+context-v3 = ["dep:rand"]
 
 [dependencies]
 affinidi-data-integrity = "0.9"
@@ -24,6 +29,9 @@ affinidi-secrets-resolver = { version = "0.6", optional = true }
 
 chrono = "0.4"
 multibase = "0.9"
+# Draws the `context-v3` salt. Already in the dependency graph (through the affinidi
+# crates), so the feature adds no new crate.
+rand = { version = "0.10", optional = true }
 serde = "1.0"
 serde_json = "1.0"
 serde_json_canonicalizer = "0.4"

@@ -912,6 +912,7 @@ const MEMBER: &str = "did:key:zMember";
 fn a_community_role_vac_verifies_for_its_role() {
     let vetter = DTGCredential::new_community_role_vac(
         COMMUNITY.into(),
+        IssuerScope::Public,
         MEMBER.into(),
         "vetter",
         t(0),
@@ -963,6 +964,43 @@ fn a_community_role_vac_verifies_for_its_role() {
         .is_err()
     );
     assert!(verify_chain(&[vetter], COMMUNITY, ROOM, "role:vetter", MEMBER, t(1)).is_err());
+}
+
+/// A community declares `directed` at minimum: a restricted community confers a role under
+/// a `directed` identifier and it verifies the same way; `pairwise` is refused at issue.
+#[test]
+fn a_community_role_vac_is_directed_at_minimum() {
+    let role = |scope| {
+        DTGCredential::new_community_role_vac(
+            COMMUNITY.into(),
+            scope,
+            MEMBER.into(),
+            "vetter",
+            t(0),
+            t(24 * 90),
+        )
+    };
+
+    let directed = role(IssuerScope::Directed).expect("a restricted community");
+    assert_eq!(directed.issuer_scope(), IssuerScope::Directed);
+    directed.validate().unwrap();
+    verify_chain(
+        std::slice::from_ref(&directed),
+        COMMUNITY,
+        COMMUNITY,
+        "role:vetter",
+        MEMBER,
+        t(1),
+    )
+    .expect("a directed community confers the role");
+
+    assert!(matches!(
+        role(IssuerScope::Pairwise),
+        Err(DTGCredentialError::IssuerScopeTooNarrow {
+            declared: IssuerScope::Pairwise,
+            minimum: IssuerScope::Directed,
+        })
+    ));
 }
 
 /// A did:scid party is one identity whichever `?src=` locator it is named with
@@ -1112,26 +1150,46 @@ mod purposes {
     /// it under v1 is refused at parse.
     #[test]
     fn a_vac_stating_purposes_lists_context_v2_and_v1_refuses_it() {
+        // A `context-v3` build issues under v3, which is v2 plus `salt` and so defines
+        // `purposes` too; stating them keeps it.
+        #[cfg(feature = "context-v3")]
+        let defining = dtg_credentials::DTG_CONTEXT_V3;
+        #[cfg(not(feature = "context-v3"))]
+        let defining = dtg_credentials::DTG_CONTEXT_V2;
+
         let vac = with(root_grant(), PurposeScope::listed(["analytics"]));
         let mut json = serde_json::to_value(vac.credential()).unwrap();
-        assert_eq!(json["@context"][1], dtg_credentials::DTG_CONTEXT_V2);
+        assert_eq!(json["@context"][1], defining);
         assert_eq!(
             json["credentialSubject"]["purposes"],
             serde_json::json!({ "scope": "listed", "purposes": ["analytics"] })
         );
-        assert!(DTGCredential::try_from(json.clone()).is_ok(), "v2 parses");
+        assert!(DTGCredential::try_from(json.clone()).is_ok(), "it parses");
 
-        json["@context"][1] = serde_json::json!(dtg_credentials::DTG_CONTEXT_V1);
+        // Under v1 or v2 there is no salt; drop it so the purposes rule is what refuses.
+        let mut unsalted = json.clone();
+        unsalted.as_object_mut().unwrap().remove("salt");
+        unsalted["@context"][1] = serde_json::json!(dtg_credentials::DTG_CONTEXT_V1);
         assert!(
-            DTGCredential::try_from(json.clone()).is_err(),
+            matches!(
+                DTGCredential::try_from(unsalted.clone()),
+                Err(DTGCredentialError::InvalidContext(_))
+            ),
             "purposes under v1"
         );
+        unsalted["@context"][1] = serde_json::json!(dtg_credentials::DTG_CONTEXT_V2);
+        assert!(
+            DTGCredential::try_from(unsalted).is_ok(),
+            "purposes under v2"
+        );
 
-        json["@context"][1] = serde_json::json!(dtg_credentials::DTG_CONTEXT_V2);
         json["credentialSubject"]["purposes"] =
             serde_json::json!({ "scope": "listed", "purposes": [] });
         assert!(
-            DTGCredential::try_from(json).is_err(),
+            matches!(
+                DTGCredential::try_from(json),
+                Err(DTGCredentialError::InvalidPurposes(_))
+            ),
             "an empty list is not any"
         );
     }

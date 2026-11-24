@@ -181,15 +181,27 @@ impl DTGCredential {
     /// The grant MUST NOT carry a `digestMultibase` — that property is what marks the
     /// other direction — and this constructor does not set one.
     ///
-    /// # `issuerScope` is always `public`
+    /// # `issuerScope` is `directed` at minimum
     ///
-    /// A community's own identifier can only truthfully be declared `public` — a community
-    /// that cannot be found cannot be joined — so there is no parameter for it: the grant
-    /// declares `public`, and a grant declaring anything else is refused at parse. The
-    /// member declares its own scope in the acknowledgement.
+    /// The community declares the scope of its own identifier: `directed` at minimum —
+    /// it must be resolvable by every party that verifies its members' credentials, and a
+    /// community has more than one member, so it is never `pairwise` — and `public` where
+    /// the community is open to outsiders. An open community (a public project, a company)
+    /// ordinarily declares `public`; a restricted one (a family, a support group) is
+    /// ordinarily better served by `directed`, since its identifier is disclosed in every
+    /// proof of membership and a `public` one lets any observer correlate that membership
+    /// across a member's presentations. Declare the same scope on every credential the
+    /// community issues under this identifier.
+    ///
+    /// A grant declaring `pairwise` is refused by [DTGCredential::validate] — and so by
+    /// `sign` — and at parse. The member declares its own scope in the
+    /// acknowledgement.
     ///
     /// issuer: The identifier of the VTC or VTN granting membership
-    /// subject: The member's identifier, or the member VTC's own for VTN membership
+    /// issuer_scope: The scope the community declares for `issuer`: [IssuerScope::Directed]
+    ///               or [IssuerScope::Public]
+    /// subject: The member's identifier — for VTN membership, the identifier of the member
+    ///          VTC or VTN
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
     /// personhood: Whether this VMC can be used as a form of Personhood Credential
@@ -203,6 +215,7 @@ impl DTGCredential {
     /// re-issuing is only recognisable as a renewal rather than a duplicate if there is one.
     pub fn new_vmc(
         issuer: String,
+        issuer_scope: IssuerScope,
         subject: String,
         valid_from: DateTime<Utc>,
         valid_until: Option<DateTime<Utc>>,
@@ -211,7 +224,7 @@ impl DTGCredential {
         let mut vmc = Self::build(
             DTGCredentialType::Membership,
             issuer,
-            IssuerScope::Public,
+            issuer_scope,
             valid_from,
             valid_until,
             CredentialSubject::Membership(CredentialSubjectMembership {
@@ -267,7 +280,8 @@ impl DTGCredential {
     /// carry `MembershipCredential` in its `type`, has no `issuer` or
     /// `credentialSubject.id`, or already carries a `digestMultibase` — that last is an
     /// acknowledgement, and acknowledging one does not form an edge. Also if its
-    /// `issuerScope` is not `public`, the only scope a community-issued grant can carry.
+    /// `issuerScope` is absent or narrower than `directed`, the minimum a community-issued
+    /// grant can carry.
     ///
     /// It is also [DTGCredentialError::NotAMembershipGrant] if the grant carries a
     /// `validUntil` that is not an RFC 3339 timestamp.
@@ -385,14 +399,18 @@ impl DTGCredential {
         let community = issuer_of(object)
             .ok_or_else(|| DTGCredentialError::NotAMembershipGrant("no `issuer`".into()))?;
 
-        // A community-issued grant declares `public`, the only scope a community can
-        // truthfully declare. One that declares anything else is not a conformant grant.
+        // A community-issued grant declares `directed` at minimum, and `public` where the
+        // community is open to outsiders. One that declares anything narrower, or anything
+        // that is not a scope, is not a conformant grant.
         match object.get("issuerScope").and_then(Value::as_str) {
-            Some("public") => {}
+            Some(declared)
+                if declared
+                    .parse::<IssuerScope>()
+                    .is_ok_and(|scope| scope.satisfies(IssuerScope::Directed)) => {}
             Some(other) => {
                 return Err(DTGCredentialError::NotAMembershipGrant(format!(
                     "the grant declares issuerScope `{other}`; a community-issued VMC is \
-                     always `public`"
+                     `directed` at minimum"
                 )));
             }
             None => {
@@ -452,10 +470,16 @@ impl DTGCredential {
     }
 
     /// Creates a new Verified Invitation Credential (VIC)
-    /// issuer: The DID of the VTC or VTN, or of an authorized member or member VTC
-    /// issuer_scope: The scope the issuer declares for `issuer` — `public` where the issuer
-    ///               is the VTC or VTN itself
-    /// subject: The DID of the prospective member or member VTC
+    /// issuer: The DID of the VTC or VTN, or of an authorized member; for a VTN invitation,
+    ///         also of a member VTC or member VTN
+    /// issuer_scope: The scope the issuer declares for `issuer`. Where the issuer is the VTC
+    ///               or VTN itself, the scope that community declares for its own
+    ///               identifier — `directed` at minimum, `public` where it is open to
+    ///               outsiders, and the same as on its grants. This library cannot tell from
+    ///               a VIC whether its issuer is the community, so it does not enforce that
+    ///               minimum here.
+    /// subject: The DID of the prospective member; for a VTN invitation, of the prospective
+    ///          member VTC or VTN
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until. Keep it short:
     ///              an invitation should be single-use and short-lived.
@@ -486,9 +510,10 @@ impl DTGCredential {
     /// `actions` MUST NOT be empty — an empty list confers nothing rather than everything.
     ///
     /// `issuer_scope` is the governing party's declaration for its own identifier —
-    /// `public` where the issuer is the party governing the scope, which a chain root's
-    /// issuer is. For a community conferring a role on a member,
-    /// [DTGCredential::new_community_role_vac] fixes it.
+    /// ordinarily `public` where the issuer is the party governing the scope, which a chain
+    /// root's issuer is. For a community conferring a role on a member,
+    /// [DTGCredential::new_community_role_vac] takes the community's own declaration, which
+    /// is `directed` at minimum.
     ///
     /// Attenuation below this VAC is permitted by default. To bound or forbid it, chain
     /// [DTGCredential::with_max_attenuation] on before signing.
@@ -567,6 +592,7 @@ impl DTGCredential {
     /// # use dtg_credentials::{DTGCredential, IssuerScope};
     /// let vac = DTGCredential::new_community_role_vac(
     ///     "did:example:community".to_string(),
+    ///     IssuerScope::Directed,
     ///     "did:example:member".to_string(),
     ///     "vetter",
     ///     Utc::now(),
@@ -574,13 +600,16 @@ impl DTGCredential {
     /// )
     /// .unwrap();
     ///
-    /// assert_eq!(vac.issuer_scope(), IssuerScope::Public);
+    /// assert_eq!(vac.issuer_scope(), IssuerScope::Directed);
     /// let authority = vac.credential().authority().unwrap();
     /// assert_eq!(authority.scope, "did:example:community");
     /// assert_eq!(authority.actions, ["role:vetter"]);
     /// ```
     ///
-    /// `issuerScope` is `public`, the only scope a community can truthfully declare. The
+    /// `issuer_scope` is the scope the community declares for its own identifier — the same
+    /// declaration as on its membership grants ([DTGCredential::new_vmc]): `directed` at
+    /// minimum, `public` where the community is open to outsiders. `pairwise` is refused,
+    /// since a community's identifier is never confined to one counterparty. The
     /// role is checked like any other action — exactly and case-sensitively, through
     /// [crate::authority::verify_chain] with `requested_scope` the community's DID and
     /// `requested_action` the `role:<name>` string. A member holding several roles holds
@@ -593,9 +622,11 @@ impl DTGCredential {
     ///
     /// # Errors
     ///
-    /// As [DTGCredential::new_vac]. `role` is not validated beyond being non-empty.
+    /// As [DTGCredential::new_vac], and [DTGCredentialError::IssuerScopeTooNarrow] if
+    /// `issuer_scope` is `pairwise`. `role` is not validated beyond being non-empty.
     pub fn new_community_role_vac(
         community: String,
+        issuer_scope: IssuerScope,
         member: String,
         role: &str,
         valid_from: DateTime<Utc>,
@@ -604,9 +635,15 @@ impl DTGCredential {
         if role.is_empty() {
             return Err(DTGCredentialError::EmptyAuthorityActions);
         }
+        if !issuer_scope.satisfies(IssuerScope::Directed) {
+            return Err(DTGCredentialError::IssuerScopeTooNarrow {
+                declared: issuer_scope,
+                minimum: IssuerScope::Directed,
+            });
+        }
         Self::new_vac(
             community.clone(),
-            IssuerScope::Public,
+            issuer_scope,
             member,
             community,
             vec![role_action(role)],
@@ -643,7 +680,8 @@ impl DTGCredential {
 
     /// States `purposes` on a VAC: what its subject may use content it obtains under the
     /// authority for (DTG Core Credentials, *Purposes of Use*). Lists [crate::DTG_CONTEXT_V2]
-    /// second, which defines the member.
+    /// second, which defines the member — or keeps `v3`, which also does, in a
+    /// `context-v3` build.
     ///
     /// On a link this library attenuated, the purposes must be within the parent's
     /// effective purposes — a link MUST NOT widen them — and this refuses ones wider than
@@ -670,7 +708,11 @@ impl DTGCredential {
             CredentialSubject::Authority(subject) => subject.purposes = Some(purposes),
             _ => return Err(DTGCredentialError::NotAnAuthorityCredential),
         }
-        if let Some(second) = self.credential.context.get_mut(1) {
+        // `v1` does not define the member; `v2` does, and so does `v3` (`v2` plus `salt`),
+        // which a `context-v3` build already lists and must keep.
+        if !crate::context_defines_purposes(&self.credential.context)
+            && let Some(second) = self.credential.context.get_mut(1)
+        {
             *second = crate::DTG_CONTEXT_V2.to_string();
         }
         Ok(self)
@@ -1435,9 +1477,10 @@ impl DTGCredential {
     ///
     /// ```
     /// # use chrono::Utc;
-    /// # use dtg_credentials::DTGCredential;
+    /// # use dtg_credentials::{DTGCredential, IssuerScope};
     /// let vmc = DTGCredential::new_vmc(
     ///     "did:example:community".to_string(),
+    ///     IssuerScope::Public,
     ///     "did:example:member".to_string(),
     ///     Utc::now(),
     ///     None,
@@ -1595,9 +1638,13 @@ impl DTGCredential {
 mod tests {
     use crate::{
         DTGCredential, DTGCredentialError, ENDORSES_V1, IssuerScope, StatementObject, WITNESSED_V1,
-        WitnessContext,
     };
-    use chrono::{DateTime, Duration, Utc};
+    // Used only by the tests pinning the v1 wire form.
+    #[cfg(not(feature = "context-v3"))]
+    use crate::WitnessContext;
+    #[cfg(not(feature = "context-v3"))]
+    use chrono::Duration;
+    use chrono::{DateTime, Utc};
     use serde_json::json;
 
     fn t0() -> DateTime<Utc> {
@@ -1609,6 +1656,7 @@ mod tests {
     fn vmc() -> DTGCredential {
         DTGCredential::new_vmc(
             "did:example:issuer".to_string(),
+            IssuerScope::Public,
             "did:example:subject".to_string(),
             t0(),
             None,
@@ -1616,6 +1664,7 @@ mod tests {
         )
     }
 
+    #[cfg(not(feature = "context-v3"))] // pins the v1 wire form
     #[test]
     fn test_vmc_serialization() {
         let txt = serde_json::to_string_pretty(&vmc()).unwrap();
@@ -1640,10 +1689,12 @@ mod tests {
         assert_eq!(txt, sample);
     }
 
+    #[cfg(not(feature = "context-v3"))] // pins the v1 wire form
     #[test]
     fn test_vmc_phc_serialization() {
         let vmc = DTGCredential::new_vmc(
             "did:example:issuer".to_string(),
+            IssuerScope::Public,
             "did:example:subject".to_string(),
             t0(),
             None,
@@ -1689,6 +1740,7 @@ mod tests {
     /// `with_id` puts the identifier at the top level of the credential — a sibling of
     /// `issuer`, not something nested under `credentialSubject` (which carries the *subject's*
     /// id, a different thing entirely).
+    #[cfg(not(feature = "context-v3"))] // pins the v1 wire form
     #[test]
     fn test_vmc_with_id_serialization() {
         let vmc = vmc().with_id("urn:uuid:1e2d3c4b-5a69-4788-9099-aabbccddeeff");
@@ -1770,6 +1822,7 @@ mod tests {
 
     /// VRC, VIC and VPC share one shape and differ in their concrete type and in the scope
     /// their issuer declares.
+    #[cfg(not(feature = "context-v3"))] // pins the v1 wire form
     #[test]
     fn test_basic_subject_serialization() {
         for (vc, type_, scope) in [
@@ -1834,6 +1887,7 @@ mod tests {
     }
 
     /// The spec's `dtg:endorses` example, byte for byte in shape.
+    #[cfg(not(feature = "context-v3"))] // pins the v1 wire form
     #[test]
     fn test_endorses_vsc_serialization() {
         let vec = DTGCredential::new_endorses_vsc(
@@ -1882,6 +1936,7 @@ mod tests {
 
     /// The spec's `dtg:witnessed` example, in shape: the citation at the top level, the
     /// digest under `object`, and `witnessContext` beside them in the subject.
+    #[cfg(not(feature = "context-v3"))] // pins the v1 wire form
     #[test]
     fn test_witnessed_vsc_serialization() {
         let session = json!({
@@ -2050,10 +2105,12 @@ mod tests {
 
     /// The community-issued role VAC: issued by the community, `public`, scoped to the
     /// community, conferring `role:<name>`.
+    #[cfg(not(feature = "context-v3"))] // pins the v1 wire form
     #[test]
     fn test_community_role_vac_serialization() {
         let vac = DTGCredential::new_community_role_vac(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             "vetter",
             t0(),

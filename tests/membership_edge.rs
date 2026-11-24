@@ -28,6 +28,7 @@ fn t(h: i64) -> DateTime<Utc> {
 fn unsigned_grant(community: &str, member: &str, valid_until: Option<DateTime<Utc>>) -> Value {
     serde_json::to_value(DTGCredential::new_vmc(
         community.into(),
+        IssuerScope::Public,
         member.into(),
         t(0),
         valid_until,
@@ -280,6 +281,7 @@ mod verifying_the_grant {
     async fn signed_grant(community: &str, member: &str, signer: &Secret) -> Value {
         let mut grant = DTGCredential::new_vmc(
             community.into(),
+            IssuerScope::Public,
             member.into(),
             t(0),
             Some(t(24 * 30)),

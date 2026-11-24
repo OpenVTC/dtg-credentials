@@ -58,8 +58,29 @@ pub const DTG_CONTEXT_V1: &str = "https://registry.trustoverip.org/dtg/context/v
 ///
 /// A VAC stating `purposes` lists this one second, since `v1` is frozen and does not define
 /// the member; a credential carrying no member `v2` added MAY continue to list `v1`. Both
-/// are recognized, and nothing else is.
+/// are recognized, as is `DTG_CONTEXT_V3` under the `context-v3` feature, and nothing else.
 pub const DTG_CONTEXT_V2: &str = "https://registry.trustoverip.org/dtg/context/v2";
+
+/// The DTG credential context, version 3: [DTG_CONTEXT_V2] and the top-level `salt`
+/// (DTG Core Credentials, *Base Structure* and *Digest Encoding — Salting*).
+///
+/// # Behind the `context-v3` feature, off by default
+///
+/// The registry has not yet published `v3`, and until its digest is recorded the
+/// specification says issuers MUST NOT emit `salt`. With the feature off this library
+/// neither emits nor accepts `v3`. With it on, every constructor lists `v3` second and
+/// draws a fresh [SALT_LEN]-byte salt, and a parse accepts `v3` — refusing one without a
+/// salt, or with a salt that is not exactly [SALT_LEN] bytes of base-58-btc multibase.
+/// `v1` and `v2` stay accepted either way, and a `salt` under either is always refused.
+///
+/// Upgrade verifiers before enabling the feature on any issuer: a verifier without it
+/// refuses every `v3` credential.
+#[cfg(feature = "context-v3")]
+pub const DTG_CONTEXT_V3: &str = "https://registry.trustoverip.org/dtg/context/v3";
+
+/// The length in bytes of a credential's `salt` (DTG Core Credentials, *Base Structure*):
+/// exactly 32, from a cryptographically secure source, fresh for each credential.
+pub const SALT_LEN: usize = 32;
 
 /// The correlation scope an issuer declares for its own identifier, carried as the
 /// REQUIRED top-level `issuerScope` of every DTG credential (DTG Core Credentials
@@ -239,9 +260,16 @@ pub enum DTGCredentialError {
     MissingTaskDigest,
 
     /// `@context` does not list the W3C VC context first and [DTG_CONTEXT_V1] or
-    /// [DTG_CONTEXT_V2] second, or a VAC states `purposes` under `v1`.
+    /// [DTG_CONTEXT_V2] (or, under the `context-v3` feature, `DTG_CONTEXT_V3`) second, or
+    /// a VAC states `purposes` under `v1`.
     #[error("malformed @context: {0}")]
     InvalidContext(String),
+
+    /// The credential's `salt` does not fit the context version it lists: a `salt` under
+    /// `v1` or `v2`, which do not define one, or — under `v3` — no `salt`, or one that is
+    /// not base-58-btc multibase decoding to exactly [SALT_LEN] bytes.
+    #[error("invalid salt: {0}")]
+    InvalidSalt(String),
 
     /// A VAC's `purposes` is not a well-formed purpose scope: an empty list, a purpose
     /// named twice, or one that is neither a registered name nor an absolute IRI.
@@ -256,8 +284,10 @@ pub enum DTGCredentialError {
 
     /// `issuerScope` is narrower than the credential type or predicate profile permits.
     ///
-    /// A community-issued VMC can only truthfully declare `public`; `witnessed/1`,
-    /// `vetted/1` and `presented/1` require `directed` at minimum.
+    /// A community-issued VMC declares `directed` at minimum (`public` where the community
+    /// is open to outsiders), as does a community conferring a role with
+    /// [DTGCredential::new_community_role_vac]; `witnessed/1`, `vetted/1` and
+    /// `presented/1` require `directed` at minimum.
     #[error("issuerScope `{declared}` is narrower than the required minimum `{minimum}`")]
     IssuerScopeTooNarrow {
         declared: IssuerScope,
@@ -807,6 +837,7 @@ impl DTGCredential {
     fn check_conformance(&self) -> Result<(), DTGCredentialError> {
         let c = &self.credential;
         check_context(&c.context)?;
+        check_salt(c)?;
         if check_type(&c.type_)? != self.type_ {
             return Err(DTGCredentialError::InvalidType(format!(
                 "the type array no longer names a {}",
@@ -816,13 +847,17 @@ impl DTGCredential {
 
         match (&self.type_, &c.credential_subject) {
             (DTGCredentialType::Membership, CredentialSubject::Membership(subject)) => {
-                // A community's own identifier can only truthfully be declared `public`: a
-                // community that cannot be found cannot be joined. The grant is the half
-                // with no digest.
-                if subject.digest_multibase.is_none() && c.issuer_scope != IssuerScope::Public {
+                // A community's own identifier is `directed` at minimum — it must be
+                // resolvable by every party that verifies its members' credentials, and a
+                // community has more than one member — and `public` where the community is
+                // open to outsiders. It is never `pairwise`. The grant is the half with no
+                // digest.
+                if subject.digest_multibase.is_none()
+                    && !c.issuer_scope.satisfies(COMMUNITY_MIN_SCOPE)
+                {
                     return Err(DTGCredentialError::IssuerScopeTooNarrow {
                         declared: c.issuer_scope,
-                        minimum: IssuerScope::Public,
+                        minimum: COMMUNITY_MIN_SCOPE,
                     });
                 }
             }
@@ -845,9 +880,10 @@ impl DTGCredential {
                     scope.check().map_err(DTGCredentialError::InvalidPurposes)?;
                     // `v1` is frozen and defines no `purposes`: a VAC stating them lists the
                     // context that does.
-                    if c.context.get(1).map(String::as_str) != Some(DTG_CONTEXT_V2) {
+                    if !context_defines_purposes(&c.context) {
                         return Err(DTGCredentialError::InvalidContext(format!(
-                            "a VAC stating `purposes` lists `{DTG_CONTEXT_V2}` second"
+                            "a VAC stating `purposes` lists `{DTG_CONTEXT_V2}` (or a later \
+                             version) second"
                         )));
                     }
                 }
@@ -1471,8 +1507,92 @@ fn check_type(types: &[String]) -> Result<DTGCredentialType, DTGCredentialError>
     Ok(concrete)
 }
 
-/// Reads the W3C VC version off an `@context` array that lists the W3C context first and
-/// [DTG_CONTEXT_V1] second, refusing any other arrangement.
+/// The minimum scope a community declares for its own identifier (DTG Core Credentials,
+/// *VMC*): `directed`, and `public` where the community is open to outsiders.
+const COMMUNITY_MIN_SCOPE: IssuerScope = IssuerScope::Directed;
+
+/// The DTG context versions this build recognizes in second position.
+#[cfg(not(feature = "context-v3"))]
+const RECOGNIZED_DTG_CONTEXTS: &[&str] = &[DTG_CONTEXT_V1, DTG_CONTEXT_V2];
+#[cfg(feature = "context-v3")]
+const RECOGNIZED_DTG_CONTEXTS: &[&str] = &[DTG_CONTEXT_V1, DTG_CONTEXT_V2, DTG_CONTEXT_V3];
+
+/// The DTG context this build's constructors list second: `v3` under the `context-v3`
+/// feature, `v1` otherwise.
+#[cfg(not(feature = "context-v3"))]
+pub(crate) const ISSUED_DTG_CONTEXT: &str = DTG_CONTEXT_V1;
+#[cfg(feature = "context-v3")]
+pub(crate) const ISSUED_DTG_CONTEXT: &str = DTG_CONTEXT_V3;
+
+/// Does the DTG context listed second define `salt`? Only `v3` does, and only a
+/// `context-v3` build recognizes `v3` at all.
+fn context_defines_salt(context: &[String]) -> bool {
+    #[cfg(feature = "context-v3")]
+    {
+        context.get(1).map(String::as_str) == Some(DTG_CONTEXT_V3)
+    }
+    #[cfg(not(feature = "context-v3"))]
+    {
+        let _ = context;
+        false
+    }
+}
+
+/// Does the DTG context listed second define a VAC's `purposes`? `v2`, and `v3`, which is
+/// `v2` with `salt` added.
+pub(crate) fn context_defines_purposes(context: &[String]) -> bool {
+    match context.get(1).map(String::as_str) {
+        Some(DTG_CONTEXT_V2) => true,
+        #[cfg(feature = "context-v3")]
+        Some(DTG_CONTEXT_V3) => true,
+        _ => false,
+    }
+}
+
+/// Holds `salt` to the context version listed: REQUIRED under `v3`, exactly [SALT_LEN]
+/// bytes in base-58-btc multibase; never present under `v1` or `v2`, which do not define
+/// it. The second rule applies whether or not the `context-v3` feature is on.
+fn check_salt(c: &DTGCommon) -> Result<(), DTGCredentialError> {
+    match (&c.salt, context_defines_salt(&c.context)) {
+        (Some(_), false) => Err(DTGCredentialError::InvalidSalt(format!(
+            "`salt` is defined only by context v3, and this credential lists `{}`",
+            c.context.get(1).map(String::as_str).unwrap_or_default()
+        ))),
+        (None, false) => Ok(()),
+        (None, true) => Err(DTGCredentialError::InvalidSalt(
+            "a credential listing context v3 MUST carry a `salt`".into(),
+        )),
+        (Some(salt), true) => {
+            let (base, bytes) = multibase::decode(salt).map_err(|e| {
+                DTGCredentialError::InvalidSalt(format!("`salt` is not multibase: {e}"))
+            })?;
+            if base != Base::Base58Btc {
+                return Err(DTGCredentialError::InvalidSalt(
+                    "`salt` MUST be base-58-btc multibase (prefix `z`)".into(),
+                ));
+            }
+            if bytes.len() != SALT_LEN {
+                return Err(DTGCredentialError::InvalidSalt(format!(
+                    "`salt` decodes to {} bytes; it MUST be exactly {SALT_LEN}",
+                    bytes.len()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A fresh salt: [SALT_LEN] bytes from the thread-local CSPRNG (`rand`'s ChaCha-based,
+/// OS-seeded generator), base-58-btc multibase encoded.
+#[cfg(feature = "context-v3")]
+pub(crate) fn fresh_salt() -> String {
+    let bytes: [u8; SALT_LEN] = rand::random();
+    multibase::encode(Base::Base58Btc, bytes)
+}
+
+/// Reads the W3C VC version off an `@context` array that lists the W3C context first and a
+/// recognized DTG context ([DTG_CONTEXT_V1], [DTG_CONTEXT_V2], and `DTG_CONTEXT_V3` under
+/// the `context-v3` feature) second, refusing any other arrangement.
 ///
 /// Further contexts — a proof suite's, a community vocabulary's — may follow in any number.
 fn check_context(context: &[String]) -> Result<W3CVCVersion, DTGCredentialError> {
@@ -1482,9 +1602,14 @@ fn check_context(context: &[String]) -> Result<W3CVCVersion, DTGCredentialError>
         _ => return Err(DTGCredentialError::UnknownVCVersion),
     };
     match context.get(1).map(String::as_str) {
-        Some(DTG_CONTEXT_V1 | DTG_CONTEXT_V2) => Ok(version),
+        Some(second) if RECOGNIZED_DTG_CONTEXTS.contains(&second) => Ok(version),
         Some(other) => Err(DTGCredentialError::InvalidContext(format!(
-            "second entry is `{other}`, not `{DTG_CONTEXT_V1}` or `{DTG_CONTEXT_V2}`"
+            "second entry is `{other}`, not one of {}",
+            RECOGNIZED_DTG_CONTEXTS
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ))),
         None => Err(DTGCredentialError::InvalidContext(format!(
             "`{DTG_CONTEXT_V1}` is not listed second"
@@ -1529,7 +1654,9 @@ pub struct DTGCommon {
     /// JSON-LD links to contexts.
     ///
     /// MUST list [W3C_VC_V2_CONTEXT] first (or, for a v1.1 credential,
-    /// [W3C_VC_V1_CONTEXT]) and [DTG_CONTEXT_V1] second, followed by any contexts a proof
+    /// [W3C_VC_V1_CONTEXT]) and a recognized DTG context — [DTG_CONTEXT_V1],
+    /// [DTG_CONTEXT_V2], or `DTG_CONTEXT_V3` under the `context-v3` feature — second,
+    /// followed by any contexts a proof
     /// type, a predicate profile or a community vocabulary requires. A later context MUST
     /// NOT redefine a term the DTG context protects.
     #[serde(rename = "@context")]
@@ -1602,6 +1729,22 @@ pub struct DTGCommon {
     /// also present and verified.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub task_context: Option<String>,
+
+    /// The credential's blinding value (DTG Core Credentials, *Base Structure* and
+    /// *Digest Encoding — Salting*): [SALT_LEN] fresh random bytes, base-58-btc multibase,
+    /// inside what the proof and every digest of the credential cover, so that a digest
+    /// referencing it cannot be tested against guessed content.
+    ///
+    /// REQUIRED under context `v3` and refused under `v1` or `v2`, which do not define it.
+    /// Only a `context-v3` build emits or accepts one. The constructors draw it, so
+    /// re-proofing a credential (`sign` again) keeps its salt and building
+    /// it anew — re-issuing — draws a new one, and with it a new digest. Do not copy a
+    /// salt between credentials.
+    ///
+    /// Where a selective-disclosure suite is used, `salt` MUST be a mandatory-disclosure
+    /// member. This library has no selective-disclosure path of its own.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub salt: Option<String>,
 
     /// The *task digest* of the Trust Task document [`DTGCommon::task_context`] names.
     ///
@@ -1843,7 +1986,10 @@ impl DTGCredential {
     ) -> Self {
         DTGCredential {
             credential: DTGCommon {
-                context: vec![W3C_VC_V2_CONTEXT.to_string(), DTG_CONTEXT_V1.to_string()],
+                context: vec![
+                    W3C_VC_V2_CONTEXT.to_string(),
+                    ISSUED_DTG_CONTEXT.to_string(),
+                ],
                 type_: vec![
                     "VerifiableCredential".to_string(),
                     "DTGCredential".to_string(),
@@ -1855,6 +2001,10 @@ impl DTGCredential {
                 valid_from,
                 valid_until,
                 task_context: None,
+                #[cfg(feature = "context-v3")]
+                salt: Some(fresh_salt()),
+                #[cfg(not(feature = "context-v3"))]
+                salt: None,
                 task_digest_multibase: None,
                 credential_subject,
                 credential_status: None,
@@ -2280,6 +2430,7 @@ mod tests {
     fn test_mutable_credential() {
         let mut vmc = DTGCredential::new_vmc(
             "did:example:issuer".to_string(),
+            IssuerScope::Public,
             "did:example:subject".to_string(),
             DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
                 .unwrap()
@@ -2646,10 +2797,11 @@ mod tests {
         );
     }
 
-    /// A community's grant can only truthfully declare `public`; the member's
-    /// acknowledgement declares whatever the member chose.
+    /// A community's grant declares `directed` at minimum, `public` where the community is
+    /// open to outsiders, and never `pairwise`; the member's acknowledgement declares
+    /// whatever the member chose.
     #[test]
-    fn test_community_issued_vmc_must_be_public() {
+    fn test_community_issued_vmc_is_directed_at_minimum() {
         let grant = |scope| {
             doc(
                 "MembershipCredential",
@@ -2657,14 +2809,25 @@ mod tests {
                 serde_json::json!({ "id": "did:example:member" }),
             )
         };
-        assert!(parse(grant("public")).is_ok());
+        assert_eq!(
+            parse(grant("public")).unwrap().issuer_scope(),
+            IssuerScope::Public
+        );
+        assert_eq!(
+            parse(grant("directed")).unwrap().issuer_scope(),
+            IssuerScope::Directed
+        );
         assert!(matches!(
-            parse_err(grant("directed")),
+            parse_err(grant("pairwise")),
             DTGCredentialError::IssuerScopeTooNarrow {
-                declared: IssuerScope::Directed,
-                minimum: IssuerScope::Public,
+                declared: IssuerScope::Pairwise,
+                minimum: IssuerScope::Directed,
             }
         ));
+        assert!(
+            parse(grant("Directed")).is_err(),
+            "compared case-sensitively"
+        );
 
         let ack = doc(
             "MembershipCredential",
@@ -2942,6 +3105,7 @@ mod tests {
 
         let mut vmc = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             Utc::now(),
             None,
@@ -2951,6 +3115,86 @@ mod tests {
         assert!(matches!(
             vmc.validate(),
             Err(DTGCredentialError::IssuerScopeTooNarrow { .. })
+        ));
+    }
+
+    /// `new_vmc` takes the community's own declaration: `directed` and `public` validate,
+    /// `pairwise` does not — so it cannot be signed either.
+    #[test]
+    fn test_new_vmc_takes_the_community_scope() {
+        let grant = |scope| {
+            DTGCredential::new_vmc(
+                "did:example:community".to_string(),
+                scope,
+                "did:example:member".to_string(),
+                Utc::now(),
+                None,
+                false,
+            )
+        };
+        for scope in [IssuerScope::Directed, IssuerScope::Public] {
+            let vmc = grant(scope);
+            assert_eq!(vmc.issuer_scope(), scope);
+            vmc.validate().unwrap();
+            let wire = serde_json::to_value(vmc.credential()).unwrap();
+            assert_eq!(wire["issuerScope"], scope.as_str());
+            assert_eq!(parse(wire).unwrap().issuer_scope(), scope);
+        }
+        assert!(matches!(
+            grant(IssuerScope::Pairwise).validate(),
+            Err(DTGCredentialError::IssuerScopeTooNarrow {
+                declared: IssuerScope::Pairwise,
+                minimum: IssuerScope::Directed,
+            })
+        ));
+    }
+
+    /// A member can acknowledge a `directed` grant; a `pairwise` one is not a conformant
+    /// grant, and a grant declaring no scope or an unknown one is not a grant at all.
+    #[test]
+    fn test_member_acknowledges_a_directed_grant() {
+        let wire = |scope: &str| {
+            let mut grant = serde_json::to_value(
+                DTGCredential::new_vmc(
+                    "did:example:community".to_string(),
+                    IssuerScope::Directed,
+                    "did:example:member".to_string(),
+                    Utc::now(),
+                    None,
+                    false,
+                )
+                .credential(),
+            )
+            .unwrap();
+            grant["issuerScope"] = serde_json::json!(scope);
+            grant
+        };
+        let ack = |grant: &Value| {
+            DTGCredential::new_member_vmc_for(
+                grant,
+                "did:example:member",
+                IssuerScope::Pairwise,
+                Utc::now(),
+                None,
+            )
+        };
+        for scope in ["directed", "public"] {
+            ack(&wire(scope)).unwrap().validate().unwrap();
+        }
+        for scope in ["pairwise", "Public", "community"] {
+            assert!(
+                matches!(
+                    ack(&wire(scope)),
+                    Err(DTGCredentialError::NotAMembershipGrant(_))
+                ),
+                "{scope}"
+            );
+        }
+        let mut unscoped = wire("public");
+        unscoped.as_object_mut().unwrap().remove("issuerScope");
+        assert!(matches!(
+            ack(&unscoped),
+            Err(DTGCredentialError::NotAMembershipGrant(_))
         ));
     }
 
@@ -3116,10 +3360,12 @@ mod tests {
     /// is compared against a value some other implementation produced. Pinned against a
     /// literal rather than a recomputation, because a test that recomputes agrees with
     /// whatever the code does and would follow the encoding silently if it drifted.
+    #[cfg(not(feature = "context-v3"))] // pins the v1 wire form
     #[test]
     fn test_digest_is_a_base58btc_multihash_over_the_proofless_jcs_form() {
         let vmc = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
                 .unwrap()
@@ -3159,6 +3405,7 @@ mod tests {
     fn the_superseded_hex_digest_is_unchanged() {
         let vmc = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
                 .unwrap()
@@ -3239,6 +3486,7 @@ mod tests {
 
         let mut vmc = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             Utc::now(),
             None,
@@ -3266,6 +3514,7 @@ mod tests {
 
         let grant = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from,
             None,
@@ -3305,6 +3554,7 @@ mod tests {
 
         let grant = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from,
             None,
@@ -3322,6 +3572,7 @@ mod tests {
         // A grant to a different member: right community, wrong edge.
         let other_member = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:someone-else".to_string(),
             valid_from,
             None,
@@ -3332,6 +3583,7 @@ mod tests {
         // A grant from a different community.
         let other_community = DTGCredential::new_vmc(
             "did:example:other-community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from,
             None,
@@ -3344,6 +3596,7 @@ mod tests {
         // consent carry over to a membership the member never agreed to.
         let renewed = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from + chrono::Duration::days(365),
             None,
@@ -3424,6 +3677,7 @@ mod tests {
 
         let mut vmc = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             Utc::now(),
             None,
@@ -3464,6 +3718,7 @@ mod tests {
 
         let mut grant = wire(&DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from,
             None,
@@ -3500,6 +3755,7 @@ mod tests {
 
         let mut grant = wire(&DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from,
             None,
@@ -3546,6 +3802,7 @@ mod tests {
 
         let mut grant = wire(&DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from,
             None,
@@ -3588,6 +3845,7 @@ mod tests {
     fn digest_multibase_json_agrees_with_digest_where_the_model_is_complete() {
         let vmc = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
                 .unwrap()
@@ -3613,6 +3871,7 @@ mod tests {
 
         let grant = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from,
             None,
@@ -3687,6 +3946,7 @@ mod tests {
 
         let grant = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from,
             None,
@@ -3774,6 +4034,7 @@ mod tests {
 
         let grant = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             valid_from,
             None,
@@ -3957,6 +4218,7 @@ mod tests {
         let vmc = |valid_from, valid_until| {
             DTGCredential::new_vmc(
                 "did:example:community".to_string(),
+                IssuerScope::Public,
                 "did:example:member".to_string(),
                 valid_from,
                 valid_until,
@@ -3989,6 +4251,7 @@ mod tests {
             .with_timezone(&Utc);
         let grant = DTGCredential::new_vmc(
             "did:example:community".to_string(),
+            IssuerScope::Public,
             "did:example:member".to_string(),
             from,
             None,
