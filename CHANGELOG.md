@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-24
+
+**Breaking:** moves to the affinidi-tdk 0.49 generation — see *Changed (breaking)* below.
+
 ### Changed (breaking)
 
 - **Moved to the affinidi-tdk 0.49 generation.** `affinidi-data-integrity` 0.8 → 0.9,
